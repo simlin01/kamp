@@ -1,0 +1,30 @@
+{
+  // Python 인터프리터 (.venv 가상환경) 경로 지정
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+  // .env 파일 자동 로드 (OPENAI_API_KEY 등)
+  "python.envFile": "${workspaceFolder}/.env",
+
+  // VS Code가 너무 많은 파일을 추적하지 않게 제외 설정
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/.venv/**": true,
+    "**/venv/**": true,
+    "**/__pycache__/**": true,
+    "**/.ipynb_checkpoints/**": true,
+    "**/Data/**": true,
+    "**/data/**": true,
+    "**/outputs/**": true,
+    "**/logs/**": true
+  },
+
+  // 탐색기에서도 숨기기 (선택 사항)
+  "files.exclude": {
+    "**/.venv": true,
+    "**/__pycache__": true,
+    "**/.ipynb_checkpoints": true
+  },
+
+  // Git 상태 계산 상한선 (선택적으로 늘리기)
+  "git.statusLimit": 20000
+}
