@@ -1,5 +1,4 @@
 ## agentfactory/config.py
-```python
 from dataclasses import dataclass
 
 @dataclass
