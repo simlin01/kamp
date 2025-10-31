@@ -3,7 +3,8 @@ from config import Config
 from src import utils
 from src import forecast as F
 from src import planner as P
-from src import report as R
+from src import planner_opt as PORT
+# from src import report as R
 from src import planner_opt as POPT
 from src import report_llm as RLLM
 
@@ -110,7 +111,7 @@ def main():
     print("[OK] Done")
     print(f"- {metrics_path}")
     print(f"- {forecast_path}")
-    print(f("- {plan_path}"))
+    print(f"- {plan_path}")        # ✅ 수정
     print(f"- {report_path}")
 
 if __name__ == "__main__":

@@ -1,0 +1,34 @@
+# === Python ===
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+*.manifest
+*.spec
+*.log
+*.tmp
+*.bak
+
+# === Virtual Environments ===
+.venv/
+venv/
+env/
+ENV/
+
+# === Jupyter ===
+.ipynb_checkpoints/
+
+# === macOS ===
+.DS_Store
+
+# === Data / Output ===
+data/
+Data/
+outputs/
+logs/
+*.csv
+*.parquet
+
+# === Env Secrets ===
+.env
