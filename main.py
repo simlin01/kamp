@@ -1,215 +1,290 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+''' CLI
+python -m main_test \
+  --data ./data/data.csv \
+  --out_dir ./outputs \
+  --prod_col Product_Number \
+  --daily_capacity 5000 \
+  --int_production \
+  --model gpt-4o-mini
+'''
+from __future__ import annotations
 
-import argparse, os, pandas as pd
-from config import Config
-from src import utils
-from src import forecast as F
-from src import planner as P
-from src import planner_opt as POPT
-from src import report_llm as RLLM
+import os, sys
+import json
+import argparse
+from datetime import datetime
+import pandas as pd
+import subprocess
+import shlex
 
-DEFAULT_PROD_COL = "Product_Number"
-DEFAULT_DT_COL = "DateTime"
+# src 패키지 import (루트에 main.py가 있고, 모듈은 src/ 폴더에 있는 구조)
+ROOT = os.path.dirname(os.path.abspath(__file__))
+if ROOT not in sys.path:
+    sys.path.insert(0, ROOT)
+sys.path.append(os.path.abspath("."))
 
+from src import features as FE
+from src import forecast as FO
+from src import planner_opt as PO
+from src import metrics as M
+from src import evaluator as EV
+from src import report_llm as RL
+
+# ---------------------------------------------------------
+# 유틸
+# ---------------------------------------------------------
+def ensure_dir(path: str):
+    if path and not os.path.exists(path):
+        os.makedirs(path, exist_ok=True)
+
+def save_json(path: str, obj):
+    ensure_dir(os.path.dirname(path))
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+def _now_str():
+    return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+# ---------------------------------------------------------
+# 파이프라인
+# ---------------------------------------------------------
+def run_pipeline(
+    data_csv: str,
+    out_dir: str,
+    prod_col: str = "Product_Number",
+    dt_col: str | None = None,
+    daily_capacity: int = 10000,
+    lambda_smooth: float = 1.0,
+    initial_inventory: float = 0.0,
+    int_production: bool = True,
+    model_name: str = "gpt-4o-mini",
+    scenario_names: list[str] | None = None,
+    policy_path: str | None = None,
+    skip_llm: bool = False,
+    best_params_path: str = "./configs/best_params.json",
+):
+    """
+    전체 파이프라인:
+      1) features: data.csv -> feat.csv
+      2) forecast: feat.csv -> pred_final.csv, metrics_final.csv
+      3) planner_opt: pred_final.csv + feat.csv -> production_plan.csv
+      4) metrics(planning): production_plan.csv -> planning_metrics.json
+      5) evaluator: verify + policy update -> policy.json (옵션)
+      6) report_llm: weekly_report.md/json (옵션)
+    """
+    ensure_dir(out_dir)
+
+    # ---------- 0) 경로 준비 ----------
+    artifacts_dir = os.path.join(out_dir, "outputs")
+    reports_dir = os.path.join(out_dir, "reports")
+    ensure_dir(artifacts_dir)
+    ensure_dir(reports_dir)
+
+    feat_csv = os.path.join(artifacts_dir, "feat.csv")
+    forecast_csv = os.path.join(artifacts_dir, "pred_final.csv")
+    forecast_metrics_csv = os.path.join(artifacts_dir, "metrics_final.csv")
+    plan_csv = os.path.join(artifacts_dir, "production_plan.csv")
+    planning_metrics_json = os.path.join(artifacts_dir, "planning_metrics.json")
+    policy_json = policy_path or os.path.join(out_dir, "policy.json")
+
+    # ---------- 1) Feature 생성 ----------
+    # data.csv -> feat.csv
+    # ---------- 1) Feature 생성 ----------
+    # data.csv -> feat.csv
+    print("[1/6] Building features ...")
+
+    # 1) 입력 CSV → DataFrame
+    raw_df = pd.read_csv(data_csv, encoding="utf-8")
+
+    # 2) 피처 생성 (DataFrame in → DataFrame out)
+    feat_df, clus_summary = FE.build_features(raw_df)
+
+    # 3) 결과 저장 (feat_csv는 위에서 artifacts_dir 기반으로 이미 정의됨)
+    #    artifacts_dir = os.path.join(out_dir, "outputs")  # 위에서 선언됨
+    ensure_dir(os.path.dirname(feat_csv))
+    feat_df.to_csv(feat_csv, index=False, encoding="utf-8")
+
+    # (선택) 클러스터 요약도 저장
+    if clus_summary is not None and not clus_summary.empty:
+        clus_csv_path = os.path.join(artifacts_dir, "cluster_summary.csv")
+        clus_summary.to_csv(clus_csv_path, index=False, encoding="utf-8")
+
+    if not os.path.exists(feat_csv):
+        raise RuntimeError(f"feat.csv not found: {feat_csv}")
+    print(f"  -> {feat_csv}")
+
+    # ---------- 2) Forecast ----------
+    # feat.csv -> pred_final.csv, metrics_final.csv
+    # ---------- 2) Forecast (CLI 호출) ----------
+    print("[2/6] Forecasting via CLI ...")
+    os.makedirs(os.path.dirname(forecast_csv), exist_ok=True)
+    if forecast_metrics_csv:
+        os.makedirs(os.path.dirname(forecast_metrics_csv), exist_ok=True)
+
+    cmd = [
+        sys.executable, "-m", "src.forecast",
+        "--in", feat_csv,
+        "--out", forecast_csv,
+        "--metrics_out", forecast_metrics_csv,
+        "--prod_col", prod_col,
+        "--model", "lgbm",
+        "--split", "time",
+        "--val_size", "0.2",
+        "--seed", "2025",
+        "--best_params_path", best_params_path
+    ]
+    # dt_col이 있으면 추가
+    if dt_col:
+        cmd.extend(["--dt_col", dt_col])
+
+    print("  CMD:", " ".join(shlex.quote(x) for x in cmd))
+    res = subprocess.run(cmd, capture_output=True, text=True)
+
+    if res.returncode != 0:
+        print(res.stdout)
+        print(res.stderr)
+        raise RuntimeError(f"forecast.py failed with code {res.returncode}")
+
+    print(res.stdout.strip() or "[forecast] done")
+    if not os.path.exists(forecast_csv):
+        raise RuntimeError(f"pred_final.csv not found: {forecast_csv}")
+    if not os.path.exists(forecast_metrics_csv):
+        print("[WARN] forecast metrics file missing; continuing:", forecast_metrics_csv)
+    print(f"  -> {forecast_csv}")
+    print(f"  -> {forecast_metrics_csv}")
+
+    # ---------- 3) Planner (CP-SAT) ----------
+    print("[3/6] Planning (CP-SAT) ...")
+    cluster_info = PO.load_cluster_info(feat_csv)
+    pred_df = pd.read_csv(forecast_csv)
+    pred_df = PO.preprocess_forecast(pred_df)
+
+    # horizons 자동 감지 (T, T+1, 또는 'T+1일 예상 수주량' 형태)
+    horizons = PO.detect_horizons(pred_df)
+
+    plan_df = PO.optimize_plan(
+        forecast_by_product=pred_df,
+        horizons=horizons,
+        prod_col=prod_col,
+        cluster_info=cluster_info,
+        daily_capacity=daily_capacity,
+        lambda_smooth=lambda_smooth,
+        initial_inventory=initial_inventory,
+        int_production=int_production,
+        scale=10,  # 소수 수요 정수화 스케일
+        # 정책 맵을 policy에서 불러와 주입할 수도 있음
+        # min_lot_map=..., safety_stock_map=..., weight_map=...
+    )
+    # 문자열 포매팅(.2f)로 생산된 경우 수치형으로도 하나 더 저장하고 싶으면 여기서 캐스팅
+    # (리포트/LNS용은 문자열도 괜찮지만, KPI 집계는 숫자가 편함)
+    for c in ["demand", "produce", "end_inventory", "backlog"]:
+        if c in plan_df.columns and plan_df[c].dtype == object:
+            try:
+                plan_df[c] = plan_df[c].astype(float)
+            except Exception:
+                pass
+
+    plan_df.to_csv(plan_csv, index=False)
+    print(f"  -> {plan_csv} (rows={len(plan_df)})")
+
+    # ---------- 4) Planning KPI ----------
+    print("[4/6] Computing planning metrics ...")
+    planning_kpi = M.compute_planning_metrics(
+        plan_df=plan_df,
+        daily_capacity=daily_capacity,
+        feat_df=pd.read_csv(feat_csv),
+        product_col=prod_col
+    )
+    save_json(planning_metrics_json, planning_kpi)
+    print(f"  -> {planning_metrics_json}")
+
+    # ---------- 5) Evaluator & Policy Update ----------
+    print("[5/6] Evaluating plan & updating policy ...")
+    metrics_summary = {
+        "forecast_metrics_csv": forecast_metrics_csv,
+        "planning_metrics": planning_kpi
+    }
+
+    # (옵션) 과거 policy를 불러와 업데이트
+    policy = EV.load_policy(policy_json) if policy_json else None
+    audit = EV.audit_and_learn(
+        plan_df=plan_df,
+        daily_capacity=daily_capacity,
+        metrics_summary={"planning_metrics": planning_kpi},
+        policy_path=policy_json,  # 전달하면 저장까지
+        llm_enabled=False  # 여기서는 규칙기반만, 필요시 True
+    )
+    save_json(os.path.join(out_dir, "audit_result.json"), audit)
+    print(f"  -> {os.path.join(out_dir, 'audit_result.json')}")
+
+    # ---------- 6) Report (LLM) ----------
+    print("[6/6] Building weekly report ...")
+    if skip_llm:
+        print("  (LLM report skipped)")
+    else:
+        out_md = os.path.join(reports_dir, f"weekly_report_{_now_str()}.md")
+        out_json = os.path.join(reports_dir, f"weekly_report_{_now_str()}.json")
+        out_verify = os.path.join(reports_dir, f"weekly_report_{_now_str()}.verify.txt")
+
+        # 단일 시나리오(기본). 여러 계획 파일 비교 시 plans=[...], scenario_names=[...] 로 전달
+        out = RL.build_report_with_llm(
+            plan_csv=plan_csv,
+            forecast_csv=forecast_csv,
+            metrics_csv=forecast_metrics_csv if os.path.exists(forecast_metrics_csv) else "",
+            model_name=model_name,
+            auto_regen_on_fail=True
+        )
+        if out.get("markdown"):
+            with open(out_md, "w", encoding="utf-8") as f:
+                f.write(out["markdown"])
+        if out.get("json") is not None:
+            save_json(out_json, out["json"])
+        if out.get("verify"):
+            with open(out_verify, "w", encoding="utf-8") as f:
+                v = out["verify"]
+                f.write(("OK" if v.get("ok") else "NG") + "\n\n")
+                f.write(v.get("report", ""))
+
+        print(f"  -> {out_md}\n  -> {out_json}\n  -> {out_verify}")
+
+    print("\n[DONE] Pipeline finished.")
+
+# ---------------------------------------------------------
+# CLI
+# ---------------------------------------------------------
 def parse_args():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, required=True, help="features.py 출력 CSV (feat.csv)")
-    ap.add_argument("--out_dir", type=str, default="./outputs")
-
-    # ✅ 모델 선택은 forecast.py 규격으로 정규화 (tweedie | lgbm)
-    ap.add_argument("--model", type=str, default="lgbm",
-                    choices=["linear", "xgboost", "lgbm", "elastic", "tweedie"])
-
-    ap.add_argument("--encoding", type=str, default="utf-8")
-    ap.add_argument("--daily_capacity", type=int, default=5000)
-    ap.add_argument("--min_lot_size", type=int, default=0)
-    ap.add_argument("--safety_stock", type=int, default=0)
-
-    # Planner / Reporter
-    ap.add_argument("--planner", type=str, default="ortools",
-                    choices=["heuristic", "ortools"])
-    ap.add_argument("--reporter", type=str, default="llm",
-                    choices=["template", "llm"])
-
-    # OR-Tools 옵션
-    ap.add_argument("--int_production", action="store_true",
-                    help="생산량을 정수로 강제")
-
-    # 🔧 (구)옵션 — 현재 버전에서 미사용. 호환성 유지를 위해 경고만 출력
-    ap.add_argument("--tune", action="store_true", help="(미사용) Optuna 튜닝")
-    ap.add_argument("--use_zeromodel", action="store_true", help="(미사용) 제로 인플레 2단계")
-    ap.add_argument("--quantiles", nargs="*", type=float, default=[], help="(미사용) 분위수")
-
-    # 검증/누출 방지 관련
-    ap.add_argument("--split", type=str, default="time", choices=["random", "time", "group"],
-                    help="검증 분할 방식: time(권장), group, random")
-    ap.add_argument("--prod_col", type=str, default=DEFAULT_PROD_COL)
-    ap.add_argument("--dt_col", type=str, default=DEFAULT_DT_COL)
-    ap.add_argument("--val_size", type=float, default=0.2)
-    ap.add_argument("--seed", type=int, default=42)
-
-    # Tweedie/LGBM 하이퍼파라미터
-    ap.add_argument("--tweedie_power", type=float, default=1.3)
-    ap.add_argument("--alpha", type=float, default=0.5)
-    ap.add_argument("--lgbm_estimators", type=int, default=800)
-    ap.add_argument("--lgbm_lr", type=float, default=0.05)
-    ap.add_argument("--lgbm_leaves", type=int, default=63)
-    ap.add_argument("--lgbm_min_child", type=int, default=50)
-    ap.add_argument("--lgbm_subsample", type=float, default=0.8)
-    ap.add_argument("--lgbm_colsample", type=float, default=0.8)
-    ap.add_argument("--lgbm_lambda", type=float, default=5.0)
-    ap.add_argument("--lgbm_power", type=float, default=1.3)
-
-    # 리포트/메트릭 저장
-    ap.add_argument("--metrics_out", type=str, default=None)
-    ap.add_argument("--feature_report", type=str, default=None)
-    ap.add_argument("--llm_model", type=str, default="gpt-4o-mini")
-    ap.add_argument("--max_chars", type=int, default=16000, help="CSV 요약 입력 길이 컷")
-    return ap.parse_args()
-
-
-def normalize_model_name(m: str) -> str:
-    """main의 모델명을 forecast.py 규격으로 매핑."""
-    m = (m or "").lower()
-    if m in ["tweedie", "linear", "elastic"]:
-        if m in ["linear", "elastic"]:
-            print("⚠️ --model", m, "→ 'tweedie'로 매핑합니다.")
-        return "tweedie"
-    if m in ["lgbm", "xgboost"]:
-        if m == "xgboost":
-            print("⚠️ --model xgboost는 현재 구현에서 'lgbm'으로 매핑합니다.")
-        return "lgbm"
-    # 기본
-    return "tweedie"
-
+    p = argparse.ArgumentParser(description="End-to-end SCM planning pipeline")
+    p.add_argument("--data", required=True, help="원본 데이터 CSV (예: ./data/data.csv)")
+    p.add_argument("--out_dir", default="./outputs", help="출력 루트 디렉토리")
+    p.add_argument("--prod_col", default="Product_Number")
+    p.add_argument("--dt_col", default=None)
+    p.add_argument("--daily_capacity", type=int, default=10000)
+    p.add_argument("--lambda_smooth", type=float, default=1.0)
+    p.add_argument("--initial_inventory", type=float, default=0.0)
+    p.add_argument("--int_production", action="store_true")
+    p.add_argument("--model", default="gpt-4o-mini", help="LLM 모델명 (report_llm)")
+    p.add_argument("--policy_path", default=None, help="정책 파일 경로(없으면 out_dir/policy.json)")
+    p.add_argument("--skip_llm", action="store_true", help="LLM 보고서 생성을 스킵")
+    p.add_argument("--best_params_path", default="./configs/best_params.json", help="forecast.py에 넘길 최적 파라미터 JSON 경로")
+    return p.parse_args()
 
 def main():
     args = parse_args()
-    cfg = Config(
+    run_pipeline(
+        data_csv=args.data,
+        out_dir=args.out_dir,
+        prod_col=args.prod_col,
+        dt_col=args.dt_col,
         daily_capacity=args.daily_capacity,
-        min_lot_size=args.min_lot_size,
-        safety_stock=args.safety_stock,
-        model_type=normalize_model_name(args.model),
-        encoding=args.encoding,
+        lambda_smooth=args.lambda_smooth,
+        initial_inventory=args.initial_inventory,
+        int_production=args.int_production,
+        model_name=args.model,
+        policy_path=args.policy_path,
+        skip_llm=args.skip_llm
     )
-    utils.ensure_dir(args.out_dir)
-
-    # 📝 미사용 옵션 경고
-    if args.tune: print("⚠️ --tune: 현재 버전에서 미사용(무시).")
-    if args.use_zeromodel: print("⚠️ --use_zeromodel: 현재 버전에서 미사용(무시).")
-    if args.quantiles: print("⚠️ --quantiles: 현재 버전에서 미사용(무시).")
-
-    # 1) Load data (feat.csv 권장)
-    df = utils.load_data(args.data, encoding=cfg.encoding)
-    df.columns = [c.strip() for c in df.columns]
-
-    # 2) 타깃 자동 탐색 (예상 수주량)
-    target_cols = F.find_target_cols(df, ["예상 수주량"])
-    if len(target_cols) == 0:
-        raise RuntimeError("타깃(예상 수주량) 컬럼이 없습니다. 열 이름에 '예상 수주량'이 포함되어야 합니다.")
-    print("🎯 Targets:", target_cols)
-
-    # 3) X, y 구성(누출 방지: 미래 '예정 수주량' & 모든 '예상 수주량'은 X에서 제외)
-    X, y, num_cols, cat_cols, excluded = F.build_xy(df, prod_col=args.prod_col, target_cols=target_cols)
-
-    # 4) 모델 파이프라인
-    model_name = normalize_model_name(args.model)
-    lgbm_params = dict(
-        tweedie_variance_power=args.lgbm_power,
-        n_estimators=args.lgbm_estimators,
-        learning_rate=args.lgbm_lr,
-        num_leaves=args.lgbm_leaves,
-        min_child_samples=args.lgbm_min_child,
-        subsample=args.lgbm_subsample,
-        colsample_bytree=args.lgbm_colsample,
-        reg_lambda=args.lgbm_lambda,
-        random_state=args.seed,
-    )
-    model = F.build_model_pipeline(
-        model_name=model_name,
-        num_cols=num_cols,
-        cat_cols=cat_cols,
-        tweedie_power=args.tweedie_power,
-        alpha=args.alpha,
-        lgbm_params=lgbm_params
-    )
-
-    # 5) Train & Validate (split: time/group/random)
-    model, metrics_df, X_va, y_va = F.train_validate(
-        df_raw=df, X=X, y=y, model=model,
-        split=args.split, val_size=args.val_size, seed=args.seed,
-        dt_col=args.dt_col, prod_col=args.prod_col
-    )
-    print("\n📊 Validation metrics (per target)")
-    print(metrics_df.to_string())
-
-    metrics_path = os.path.join(args.out_dir, "forecast_validation_metrics.csv")
-    if args.metrics_out:
-        metrics_path = args.metrics_out
-    utils.save_csv(metrics_df, metrics_path)
-
-    # 6) Feature report (선택)
-    if args.feature_report:
-        pd.DataFrame({"used_numeric_features": pd.Series(num_cols)}).to_csv(
-            args.feature_report, index=False, encoding="utf-8-sig"
-        )
-        pd.DataFrame({"excluded_features": pd.Series(excluded)}).to_csv(
-            args.feature_report.replace(".csv", "_excluded.csv"), index=False, encoding="utf-8-sig"
-        )
-        print(f"💾 피처 리포트 저장: {args.feature_report} / {args.feature_report.replace('.csv', '_excluded.csv')}")
-
-    # 7) 전체 예측 → 제품별 집계
-    pred_df = F.predict_all(model, X_all=X, prod_col=args.prod_col, target_cols=target_cols)
-    forecast_by_product = F.aggregate_by_product(pred_df, args.prod_col)
-
-    forecast_path = os.path.join(args.out_dir, "forecast_by_product.csv")
-    utils.save_csv(forecast_by_product, forecast_path)
-
-    # 8) Planning
-    if args.planner == "heuristic":
-        plan_df = P.plan_production(
-            forecast_by_product=forecast_by_product,
-            horizons=target_cols,
-            prod_col=args.prod_col,
-            daily_capacity=cfg.daily_capacity,
-            min_lot_size=cfg.min_lot_size,
-            safety_stock=cfg.safety_stock
-        )
-    else:
-        plan_df = POPT.optimize_plan(
-            forecast_by_product=forecast_by_product,
-            horizons=target_cols,
-            prod_col=args.prod_col,
-            daily_capacity=cfg.daily_capacity,
-            min_lot_size=cfg.min_lot_size,
-            safety_stock=cfg.safety_stock,
-            int_production=args.int_production
-        )
-    plan_path = os.path.join(args.out_dir, "production_plan.csv")
-    utils.save_csv(plan_df, plan_path)
-
-    # 9) Reporting
-    if args.reporter == "template":
-        raise NotImplementedError("템플릿 리포터는 현재 주석 처리되어 있습니다. --reporter llm을 사용하세요.")
-    else:
-        report_txt = RLLM.build_report_with_llm(
-            plan_csv=plan_path,
-            forecast_csv=forecast_path,
-            metrics_csv=metrics_path,
-            model_name=args.llm_model,
-            max_chars=args.max_chars
-        )
-    report_path = os.path.join(args.out_dir, "weekly_report.txt")
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write(report_txt)
-
-    print("[✅ Done]")
-    print(f"- Forecast metrics: {metrics_path}")
-    print(f"- Forecast by product: {forecast_path}")
-    print(f"- Production plan: {plan_path}")
-    print(f"- Weekly report: {report_path}")
-
 
 if __name__ == "__main__":
     main()
