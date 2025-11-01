@@ -1,0 +1,10 @@
+{
+  "power": 1.109279147587289,
+  "lr": 0.010410201541386008,
+  "n_estimators": 918,
+  "num_leaves": 255,
+  "min_child_samples": 12,
+  "subsample": 0.601622375617573,
+  "colsample_bytree": 0.9943923942537837,
+  "reg_lambda": 11.936803808090815
+}
