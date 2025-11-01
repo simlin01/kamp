@@ -1,4 +1,5 @@
 # # src/report_llm.py
+
 # [FILES]
 # [PRODUCTION_PLAN_CSV]
 # {plan_txt}
@@ -17,30 +18,16 @@
 # 5) 리스크/가정: 데이터 품질/제약 가정 간단 표기
 # """)
 
-
 """
-forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
-- 누출 방지: 'T+숫자일 예정 수주량' 완전 제외
-- DateTime/제품키 포함 저장
-- (--tune, --trials) 하이퍼파라미터 튜닝 지원 (Optuna 있으면 사용)
 
 CLI - 단일 플랜 (하위호환)
 python -m src.report_llm \
-  --plan ./artifacts/plan_baseline.csv \
-  --forecast ./artifacts/forecast_by_product.csv \
-  --metrics ./artifacts/forecast_metrics.csv \
+  --plan ./outputs/production_plan.csv \
+  --forecast ./outputs/pred_final.csv \
+  --metrics ./outputs/metrics_final.csv \
+  --model gpt-4o-mini \
   --out_md ./reports/weekly_report.md \
   --out_json ./reports/weekly_report.json
-
-
-CIL - 복수 시나리오 + 이름 + 자동 검증/재생성
-python -m src.report_llm \
-  --plans ./artifacts/plan_capa-10.csv,./artifacts/plan_capa+10_lot50.csv,./artifacts/plan_safety200.csv \
-  --scenario_names "CAPA-10","CAPA+10/LOT=50","SAFETY=200" \
-  --forecast ./artifacts/forecast_by_product.csv \
-  --metrics ./artifacts/forecast_metrics.csv \
-  --out_md ./reports/weekly_report.md \
-  --out_json ./reports/weekly_report.json \
   --out_verify ./reports/weekly_report.verify.txt
 """
 
@@ -64,6 +51,18 @@ load_dotenv()
 # =========================================================
 # 유틸
 # =========================================================
+def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    clean = []
+    for c in df.columns:
+        s = str(c).strip().replace("\ufeff","").replace("\u200b","").replace("\u200c","").replace("\u200d","").replace("\xa0","")
+        clean.append(s)
+    df.columns = clean
+    if df.columns.duplicated().any():
+        df = df.loc[:, ~df.columns.duplicated()].copy()
+    return df
+
 def _exists(path: str) -> bool:
     return bool(path) and os.path.exists(path)
 
@@ -99,6 +98,147 @@ def _pick(cols_map: Dict[str, str], cands: List[str]) -> Optional[str]:
         if any(name.lower() in k for name in cands):
             return cols_map[k]
     return None
+
+def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
+    real = [c for c in cols if c and c in df.columns]
+    for c in real:
+        if not pd.api.types.is_numeric_dtype(df[c]):
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+def _first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+def summarize_by_product(plan_csv: str, product_col_candidates=("product_number","product","제품")) -> Dict:
+    print("[DEBUG] plan.csv columns:", list(pd.read_csv(plan_csv).columns))
+    """
+    production_plan.csv를 제품 단위로 집계:
+      - sum(produce, demand, backlog, end_inventory)
+      - BacklogRate = backlog / (demand + 1e-9)
+      - Top5 backlog, Top5 overproduction(= end_inventory 상위 또는 대안 점수)
+    반환: { "table_head": [...], "top_backlog": [...], "top_overprod": [...] }
+    """
+    if not _exists(plan_csv):
+        return {"missing": True, "path": plan_csv}
+
+    df = pd.read_csv(plan_csv)
+    cols = {c.lower(): c for c in df.columns}
+
+    # 느슨한 매칭으로 컬럼 찾기
+    col_prodname = _pick(cols, list(product_col_candidates))
+    col_prod     = _pick(cols, ["prod","produce","production","생산"])
+    col_dem      = _pick(cols, ["demand","수요"])
+    col_back     = _pick(cols, ["backlog","백로그"])
+    col_inv      = _pick(cols, ["inv","inventory","재고"])
+
+    if not col_prodname or not col_prod or not col_dem:
+        return {"missing": False, "schema_error": True, "columns": list(df.columns)}
+
+    # 숫자형 변환(실존 컬럼만)
+    df = _coerce_numeric(df, [col_prod, col_dem, col_back, col_inv])
+
+    # 그룹핑 (as_index=False로 인덱스 충돌 회피)
+    agg_dict = {col_prod: "sum", col_dem: "sum"}
+    if col_back: agg_dict[col_back] = "sum"
+    if col_inv:  agg_dict[col_inv]  = "sum"
+
+    grp = df.groupby(col_prodname, dropna=False, as_index=False).agg(agg_dict)
+
+    # 열명 표준화 (가능한 경우만)
+    rename_map = {col_prodname: "Product_Number", col_prod: "produce", col_dem: "demand"}
+    if col_back: rename_map[col_back] = "backlog"
+    if col_inv:  rename_map[col_inv]  = "end_inventory"
+    grp = grp.rename(columns=rename_map)
+
+    # 만약 rename 후에도 Product_Number가 없다면, 자동 탐색으로 대체
+    prod_col_final = "Product_Number" if "Product_Number" in grp.columns else \
+                     _first_existing(grp, [col_prodname] + list(grp.columns))
+    if prod_col_final != "Product_Number" and prod_col_final in grp.columns:
+        grp = grp.rename(columns={prod_col_final: "Product_Number"})
+        prod_col_final = "Product_Number"
+    
+    # 누락 컬럼 채움
+    if "backlog" not in grp.columns:
+        grp["backlog"] = 0.0
+    if "end_inventory" not in grp.columns:
+        grp["end_inventory"] = 0.0
+
+    # 지표
+    grp["BacklogRate"] = grp["backlog"] / (grp["demand"] + 1e-9)
+
+    # Top 5 — 증산 필요(백로그 상위)
+    # 실제 존재하는 컬럼만 안전하게 선택
+    top_backlog_df = grp.sort_values("backlog", ascending=False).head(5).copy()
+    top_backlog_df = _dedup_columns(top_backlog_df)
+    safe_cols_back = [c for c in ["Product_Number", "backlog", "BacklogRate"] if c in top_backlog_df.columns]
+    top_backlog = top_backlog_df[safe_cols_back].to_dict(orient="records")
+
+    # Top 5 — 과다 생산(재고 상위; 재고 없으면 (produce - demand)+ 근사)
+    # 1) 안전하게 숫자형 보정
+    for c in ["produce", "demand", "end_inventory"]:
+        if c in grp.columns and not pd.api.types.is_numeric_dtype(grp[c]):
+            grp[c] = pd.to_numeric(grp[c], errors="coerce")
+
+    # 2) 항상 _over_score를 생성 (존재하지 않으면 0.0으로라도 채움)
+    over_col = "_over_score"
+    if "end_inventory" in grp.columns:
+        over_score = grp["end_inventory"].fillna(0.0).copy()
+    else:
+        over_score = pd.Series(0.0, index=grp.index)
+
+    # 재고가 전부 0/NaN이면 (produce - demand)+ 로 대체
+    if float(over_score.fillna(0).sum()) == 0.0 and {"produce","demand"} <= set(grp.columns):
+        approx = (grp["produce"].fillna(0.0) - grp["demand"].fillna(0.0)).clip(lower=0.0)
+        over_score = approx
+
+    # 반드시 붙인다 (길이 맞춰서)
+    if len(over_score) != len(grp):
+        over_score = pd.Series(0.0, index=grp.index)
+    grp[over_col] = over_score.fillna(0.0).astype(float)
+
+    # 3) 정렬 전에 혹시 모를 중복 컬럼 제거
+    if grp.columns.duplicated().any():
+        grp = grp.loc[:, ~grp.columns.duplicated()].copy()
+    # (여기까지 오면 _over_score가 반드시 존재)
+    top_overprod_df = grp.sort_values(over_col, ascending=False).head(5).copy()
+
+    # 4) 안전 선택 + rename
+    safe_cols_over = [c for c in ["Product_Number", over_col] if c in top_overprod_df.columns]
+    if "Product_Number" not in safe_cols_over:
+        # 제품 컬럼이 표준명 아닌 경우 대비
+        prod_fallback = next((c for c in top_overprod_df.columns if c.lower() in {"product_number","product","제품"}), None)
+        if prod_fallback:
+            safe_cols_over = [prod_fallback, over_col]
+            top_overprod = (top_overprod_df[safe_cols_over]
+                            .rename(columns={prod_fallback: "Product_Number", over_col: "over_score"})
+                            .to_dict(orient="records"))
+        else:
+            # 제품 컬럼이 없다면 index를 이름으로 대체
+            top_overprod_df = top_overprod_df.reset_index().rename(columns={"index":"Product_Number"})
+            safe_cols_over = ["Product_Number", over_col]
+            top_overprod = (top_overprod_df[safe_cols_over]
+                            .rename(columns={over_col: "over_score"})
+                            .to_dict(orient="records"))
+    else:
+        top_overprod = (top_overprod_df[safe_cols_over]
+                        .rename(columns={over_col: "over_score"})
+                        .to_dict(orient="records"))
+    # 프리뷰 테이블(상위 40행) — 존재하는 컬럼만
+    preview_cols = [c for c in ["Product_Number","produce","demand","backlog","end_inventory","BacklogRate"] if c in grp.columns]
+    table_preview_df = grp.sort_values("backlog", ascending=False).head(40)[preview_cols].copy()
+    table_preview_df = _dedup_columns(table_preview_df)
+    table_preview = table_preview_df.to_dict(orient="records")
+
+    return {
+        "missing": False,
+        "schema_error": False,
+        "table_head": table_preview,
+        "top_backlog": top_backlog,
+        "top_overprod": top_overprod
+    }
 
 # =========================================================
 # 1) Plan 요약 + (신규) 다중 시나리오 KPI / Pareto
@@ -326,6 +466,7 @@ SYS_PROMPT = (
 USER_TASK = """다음의 '사전 정량 요약(Facts)'은 CSV에서 직접 계산된 사실입니다.
 이 사실을 최우선으로 반영하여 보고서를 작성하세요.
 추가로 제공되는 '샘플 미리보기'는 참고용이며, 길이 제한으로 인해 전체가 아닙니다.
+제품별 요약(product_summary)의 Top5(backlog/overproduction)를 정확히 반영하세요.
 
 [Facts(JSON)]
 {facts_json}
@@ -483,11 +624,14 @@ def build_report_with_llm(
     metrics_sum = summarize_metrics(metrics_csv) if metrics_csv else {}
     forecast_sum = summarize_forecast_by_product(forecast_csv) if forecast_csv else {}
 
+    product_summary = summarize_by_product(plans[0]) if plans else {}
+
     facts = {
         "plan_scenarios": plans_summary,     # 다중 시나리오 KPI + Pareto
         "plan_summary_rep": rep_sum,         # 대표(첫 번째) 요약 (단일 입력과 호환)
         "metrics_summary": metrics_sum,
         "forecast_summary": forecast_sum,
+        "product_summary": product_summary,
     }
 
     # ----- 샘플 미리보기
@@ -500,6 +644,16 @@ def build_report_with_llm(
         samples.append(f"[FORECAST_BY_PRODUCT]\n{_read_clip_csv(forecast_csv, max_rows=max_head_rows, max_chars=max_chars)}")
     if metrics_csv:
         samples.append(f"[FORECAST_METRICS]\n{_read_clip_csv(metrics_csv, max_rows=max_head_rows, max_chars=max_chars)}")
+    if product_summary and not product_summary.get("missing") and not product_summary.get("schema_error"):
+        try:
+            df_preview = pd.DataFrame(product_summary.get("table_head", []))
+            if not df_preview.empty:
+                txt = df_preview.to_csv(index=False)
+                if len(txt) > max_chars:
+                    txt = txt[:max_chars] + f"\n...[truncated to {max_chars} chars]"
+                samples.append(f"[PRODUCT_SUMMARY_BY_ITEM]\n{txt}")
+        except Exception:
+            pass
 
     sys = SystemMessage(content=SYS_PROMPT)
     user = HumanMessage(content=USER_TASK.format(
