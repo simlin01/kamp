@@ -1,40 +1,4 @@
 # # src/report_llm.py
-# import os
-# import pandas as pd
-
-# from langchain_openai import ChatOpenAI
-# from langchain_core.messages import HumanMessage, SystemMessage
-
-# def _read_clip(path: str, max_chars: int) -> str:
-#     if not os.path.exists(path):
-#         return f"[MISSING] {path}"
-#     txt = pd.read_csv(path).to_csv(index=False)
-#     if len(txt) > max_chars:
-#         txt = txt[:max_chars] + f"\n...[truncated to {max_chars} chars]"
-#     return txt
-
-# def build_report_with_llm(
-#     plan_csv: str,
-#     forecast_csv: str,
-#     metrics_csv: str,
-#     model_name: str = "gpt-4o-mini",
-#     max_chars: int = 16000
-# ) -> str:
-#     api_key = os.getenv("OPENAI_API_KEY")
-#     if not api_key:
-#         raise RuntimeError("OPENAI_API_KEY 환경변수를 설정하세요.")
-
-#     plan_txt = _read_clip(plan_csv, max_chars)
-#     forecast_txt = _read_clip(forecast_csv, max_chars)
-#     metrics_txt = _read_clip(metrics_csv, max_chars)
-
-#     sys = SystemMessage(content=(
-#         "You are an operations planning analyst AI. "
-#         "Summarize supply-chain production plan and forecasting quality for a weekly executive report. "
-#         "Be concise, numeric, and actionable. Provide bullet points and sections."
-#     ))
-
-#     user = HumanMessage(content=f"""
 # [FILES]
 # [PRODUCTION_PLAN_CSV]
 # {plan_txt}
@@ -53,11 +17,6 @@
 # 5) 리스크/가정: 데이터 품질/제약 가정 간단 표기
 # """)
 
-#     llm = ChatOpenAI(model=model_name, temperature=0.2)
-#     out = llm([sys, user]).content
-#     return out
-
-# src/report_llm.py
 
 """
 forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
@@ -98,6 +57,9 @@ import numpy as np
 
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # =========================================================
 # 유틸
@@ -432,6 +394,7 @@ class LLMConfig:
     retry_backoff_sec: float = 2.5
 
 def _call_llm(messages, cfg: LLMConfig) -> str:
+    import os, time
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 환경변수를 설정하세요.")
@@ -439,7 +402,8 @@ def _call_llm(messages, cfg: LLMConfig) -> str:
     last_err = None
     for i in range(cfg.max_retries):
         try:
-            return llm(messages).content
+            resp = llm.invoke(messages)
+            return resp.content if hasattr(resp, "content") else str(resp)
         except Exception as e:
             last_err = e
             time.sleep(cfg.retry_backoff_sec * (i + 1))
@@ -572,6 +536,13 @@ def build_report_with_llm(
 
     return {"json": js, "markdown": md, "raw": raw, "verify": verification, "regen": regen}
 
+from pathlib import Path
+
+def _ensure_parent_dir(path: str):
+    p = Path(path)
+    if p.parent:  # 빈 문자열 대비
+        p.parent.mkdir(parents=True, exist_ok=True)
+
 # =========================================================
 # 6) CLI
 # =========================================================
@@ -610,12 +581,17 @@ def main():
 
     # 저장
     if out.get("markdown"):
+        _ensure_parent_dir(args.out_md)
         with open(args.out_md, "w", encoding="utf-8") as f:
             f.write(out["markdown"])
+
     if out.get("json") is not None:
+        _ensure_parent_dir(args.out_json)
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(out["json"], f, ensure_ascii=False, indent=2)
+
     if out.get("verify"):
+        _ensure_parent_dir(args.out_verify)
         with open(args.out_verify, "w", encoding="utf-8") as f:
             v = out["verify"]
             f.write(("OK" if v.get("ok") else "NG") + "\n\n")
