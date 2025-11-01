@@ -4,6 +4,14 @@
 evaluator.py
 - 통합 감사(Audit): 규칙 기반 검증 + LLM 기반 자기평가/상호검증
 - 정책 학습(Policy): 성과 기반 파라미터 자동 업데이트, 저장/로딩
+
+python -m src.evaluator \
+  --plan_csv ./outputs/production_plan.csv \
+  --daily_capacity 5000 \
+  --metrics_json ./outputs/planning_metrics.json \
+  --policy_path ./outputs/policy.json \
+  --out_json ./outputs/governance_audit.json
+
 """
 
 from __future__ import annotations
@@ -158,3 +166,44 @@ def audit_and_learn(
         "policy": policy,
         "need_replan": need_replan
     }
+
+if __name__ == "__main__":
+    import argparse, os, json
+
+    ap = argparse.ArgumentParser(description="Planner Evaluator (verify → fixes → policy update)")
+    ap.add_argument("--plan_csv", required=True, help="production_plan.csv 경로")
+    ap.add_argument("--daily_capacity", type=float, required=True, help="일일 CAPA")
+    ap.add_argument("--metrics_json", type=str, default=None, help="planning_metrics.json 경로(옵션)")
+    ap.add_argument("--policy_path", type=str, default=None, help="정책 저장/로드 파일 경로(옵션)")
+    ap.add_argument("--llm_enabled", action="store_true", help="LLM 기반 critique/crosscheck 사용")
+    ap.add_argument("--out_json", type=str, default=None, help="감사 결과 저장 경로(기본: plan_csv 옆 audit.json)")
+    args = ap.parse_args()
+
+    # 입력 불러오기
+    plan_df = pd.read_csv(args.plan_csv)
+    # 숫자 보정 (문자열로 저장된 .2f 대응)
+    for c in ["demand", "produce", "backlog", "end_inventory"]:
+        if c in plan_df.columns:
+            plan_df[c] = pd.to_numeric(plan_df[c], errors="coerce").fillna(0.0)
+
+    metrics_summary = None
+    if args.metrics_json and os.path.exists(args.metrics_json):
+        with open(args.metrics_json, "r", encoding="utf-8") as f:
+            metrics_summary = json.load(f)
+
+    # 감사 & 정책 업데이트
+    result = audit_and_learn(
+        plan_df=plan_df,
+        daily_capacity=args.daily_capacity,
+        metrics_summary=metrics_summary,
+        policy_path=args.policy_path,
+        llm_enabled=args.llm_enabled,
+    )
+
+    # 출력 저장
+    out_path = args.out_json or os.path.join(os.path.dirname(args.plan_csv), "governance_audit.json")
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(result, f, ensure_ascii=False, indent=2)
+    print(f"[OK] Saved evaluator output → {out_path}")
+    if not result.get("verify", {}).get("ok", True):
+        print("[WARN] Verification issues detected. See 'issues' in the JSON.")
