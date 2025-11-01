@@ -25,6 +25,9 @@ requests>=2.31.0
 packaging>=23.0
 pathlib>=1.0.1
 
+# === Statistical Analysis ===
+statsmodels>=0.14.0
+
 # === Optional / Recommended ===
 # 모델 해석 및 검증용
 shap>=0.44.0
