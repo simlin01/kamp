@@ -9,6 +9,9 @@ forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
 - 학습에 실제 적용된 파라미터 요약 출력
 - 완전 재현용 결정론 모드(--deterministic) 옵션 제공
 - 튜닝 결과를 JSON으로 저장/로드(--best_params_path, --save_best_params)
+- (NEW) 잔차 분포 기반 MC 수요 시나리오 생성 기능 추가:
+    - --mc_scenarios S (0이면 비활성)
+    - --mc_out 저장 경로 (미지정 시 <out>_mc.npz)
 
 CLI - 기본:
 python src/forecast.py \
@@ -52,6 +55,20 @@ python src/forecast.py \
   --seed 2025 \
   --best_params_path ./configs/best_params.json \
   --deterministic
+
+CLI - MC scenarios:
+python src/forecast.py \
+  --in ./data/feat.csv \
+  --out ./outputs/pred_final.csv \
+  --metrics_out ./outputs/metrics_final.csv \
+  --prod_col Product_Number \
+  --dt_col DateTime \
+  --model lgbm \
+  --split time \
+  --val_size 0.2 \
+  --seed 2025 \
+  --best_params_path ./configs/best_params.json \
+  --mc_scenarios 200
 """
 
 from typing import List, Tuple, Dict
@@ -137,13 +154,16 @@ def build_xy(df: pd.DataFrame, prod_col: str, target_cols: List[str], log_target
     if prod_col not in df.columns:
         raise ValueError(f"'{prod_col}' 컬럼이 없습니다.")
     y = df[target_cols].astype(float).clip(lower=0)
-    if log_target: y = np.log1p(y)
+    if log_target:
+        y = np.log1p(y)
     num_cols, excluded = select_feature_columns(df, prod_col, target_cols)
     cat_cols = [prod_col]
-    if len(num_cols)==0: raise RuntimeError("사용 가능한 수치형 피처가 없습니다. features.py를 확인하세요.")
+    if len(num_cols) == 0:
+        raise RuntimeError("사용 가능한 수치형 피처가 없습니다. features.py를 확인하세요.")
     X = df[num_cols + cat_cols].copy()
     print(f"Features used: {len(num_cols)} numeric + {len(cat_cols)} categorical")
-    if excluded: print(f"Excluded (leakage/targets): {len(excluded)} cols")
+    if excluded:
+        print(f"Excluded (leakage/targets): {len(excluded)} cols")
     return X, y, num_cols, cat_cols, excluded
 
 # =============== Metrics ===============
@@ -155,13 +175,16 @@ def binary_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
     auc = _safe(roc_auc_score, y_true_bin, y_score)
     uniq = np.unique(y_score)
     if len(uniq) > 200:
-        uniq = np.unique(np.quantile(y_score, np.linspace(0,1,200)))
-    best = {"f1":-1.0,"p":np.nan,"r":np.nan,"thr":0.0}
+        uniq = np.unique(np.quantile(y_score, np.linspace(0, 1, 200)))
+    best = {"f1": -1.0, "p": np.nan, "r": np.nan, "thr": 0.0}
     for thr in uniq:
         y_pred = (y_score >= thr).astype(int)
-        p,r,f,_ = precision_recall_fscore_support(y_true_bin,y_pred,average="binary",zero_division=0)
-        if f>best["f1"]: best={"f1":float(f),"p":float(p),"r":float(r),"thr":float(thr)}
-    return {"AUC":float(auc),"F1":best["f1"],"Precision":best["p"],"Recall":best["r"],"BestThreshold":best["thr"]}
+        p, r, f, _ = precision_recall_fscore_support(
+            y_true_bin, y_pred, average="binary", zero_division=0
+        )
+        if f > best["f1"]:
+            best = {"f1": float(f), "p": float(p), "r": float(r), "thr": float(thr)}
+    return {"AUC": float(auc), "F1": best["f1"], "Precision": best["p"], "Recall": best["r"], "BestThreshold": best["thr"]}
 
 def smape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
     y_true = np.asarray(y_true, dtype=float)
@@ -187,23 +210,30 @@ def group_split(df_raw: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame, group_co
     return X.iloc[tr_idx], X.iloc[va_idx], y.iloc[tr_idx], y.iloc[va_idx]
 
 # =============== Pipeline ===============
-def build_model_pipeline(model_name: str, num_cols: List[str], cat_cols: List[str],
-                         tweedie_power: float, alpha: float, lgbm_params: Dict,
-                         reg_n_jobs: int = -1) -> Pipeline:
+def build_model_pipeline(
+    model_name: str,
+    num_cols: List[str],
+    cat_cols: List[str],
+    tweedie_power: float,
+    alpha: float,
+    lgbm_params: Dict,
+    reg_n_jobs: int = -1,
+) -> Pipeline:
     if model_name == "tweedie":
         base = MultiOutputRegressor(
             TweedieRegressor(power=tweedie_power, alpha=alpha, link="log", max_iter=2000),
-            n_jobs=reg_n_jobs
+            n_jobs=reg_n_jobs,
         )
         prep = ColumnTransformer(
             [("num", RobustScaler(), num_cols), ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)]
         )
         return Pipeline([("prep", prep), ("reg", base)])
     elif model_name == "lgbm":
-        if lgb is None: raise RuntimeError("lightgbm 미설치. pip install lightgbm")
+        if lgb is None:
+            raise RuntimeError("lightgbm 미설치. pip install lightgbm")
         base = MultiOutputRegressor(
             lgb.LGBMRegressor(**lgbm_params, n_jobs=reg_n_jobs),
-            n_jobs=reg_n_jobs
+            n_jobs=reg_n_jobs,
         )
         prep = ColumnTransformer(
             [("num", "passthrough", num_cols), ("cat", OneHotEncoder(handle_unknown="ignore"), cat_cols)]
@@ -212,32 +242,77 @@ def build_model_pipeline(model_name: str, num_cols: List[str], cat_cols: List[st
     else:
         raise ValueError("지원하지 않는 모델 이름")
 
+# =============== (NEW) MC Scenario Generation ===============
+def generate_demand_scenarios(
+    d_hat: np.ndarray,
+    residuals: np.ndarray,
+    n_scenarios: int,
+    seed: int = 2025
+) -> np.ndarray:
+    """
+    잔차(residual) 분포 기반으로 수요 시나리오를 생성한다.
+    d_hat: (n, k) 점추정 수요
+    residuals: (m, k) validation residual pool (y_true - y_pred)
+    return: (S, n, k)
+    """
+    rng = np.random.default_rng(seed)
+    S = int(n_scenarios)
+    if S <= 0:
+        raise ValueError("n_scenarios must be positive")
+
+    n, k = d_hat.shape
+    m = residuals.shape[0]
+    if residuals.ndim != 2 or residuals.shape[1] != k:
+        raise ValueError(f"residuals shape must be (m, {k}), got {residuals.shape}")
+
+    scenarios = np.empty((S, n, k), dtype=float)
+    for j in range(k):
+        idx = rng.integers(0, m, size=(S, n))
+        e = residuals[idx, j]  # (S, n)
+        scenarios[:, :, j] = np.maximum(0.0, d_hat[:, j][None, :] + e)
+
+    return scenarios
+
 # =============== Train / Validate / Predict ===============
-def train_validate(df_raw, X, y, model, split="time", val_size=0.2, seed=2025, dt_col=DEFAULT_DT_COL, prod_col=DEFAULT_PROD_COL, log_target=False):
-    if split=="time":
+def train_validate(
+    df_raw, X, y, model,
+    split="time", val_size=0.2, seed=2025,
+    dt_col=DEFAULT_DT_COL, prod_col=DEFAULT_PROD_COL,
+    log_target=False
+):
+    if split == "time":
         X_tr, X_va, y_tr, y_va = time_split(df_raw, X, y, dt_col, val_size)
-    elif split=="group":
+    elif split == "group":
         X_tr, X_va, y_tr, y_va = group_split(df_raw, X, y, prod_col, val_size, seed)
     else:
         X_tr, X_va, y_tr, y_va = train_test_split(X, y, test_size=val_size, random_state=seed)
 
     model.fit(X_tr, y_tr.values)
     pred = np.maximum(0.0, np.asarray(model.predict(X_va), dtype=float))
-    if log_target:
-        pred, y_va = np.expm1(pred), np.expm1(y_va)
 
+    if log_target:
+        pred = np.expm1(pred)
+        y_va = np.expm1(y_va)
+
+    # ---- metrics
     rows = {}
     for i, t in enumerate(y.columns):
         yt = y_va[t].values
         pt = pred[:, i]
         rows[t] = {
             "MAE": mean_absolute_error(yt, pt),
-            "RMSE": rmse(yt, pt),          # ← 추가
-            "R2":  r2_score(yt, pt),
+            "RMSE": rmse(yt, pt),
+            "R2": r2_score(yt, pt),
             "SMAPE": smape(yt, pt),
-            **binary_metrics(yt, pt)
+            **binary_metrics(yt, pt),
         }
-    return model, pd.DataFrame(rows).T
+
+    # ---- residual pool for MC (validation residuals)
+    y_true = y_va.values.astype(float)   # (n_val, k)
+    y_pred = pred.astype(float)          # (n_val, k)
+    residuals = y_true - y_pred          # (n_val, k)
+
+    return model, pd.DataFrame(rows).T, residuals
 
 def predict_all(model, X_all, df_raw, prod_col, dt_col, target_cols):
     pred = np.maximum(0.0, np.asarray(model.predict(X_all), dtype=float))
@@ -256,10 +331,11 @@ def aggregate_by_product(pred_df, prod_col):
 
 # =============== Tuning ===============
 def average_mae(metrics_df, target_cols, emphasize=None):
-    w = {t:1.0 for t in target_cols}
+    w = {t: 1.0 for t in target_cols}
     if emphasize:
-        for k,v in emphasize.items():
-            if k in w: w[k]=float(v)
+        for k, v in emphasize.items():
+            if k in w:
+                w[k] = float(v)
     total_w = sum(w.values())
     return float((metrics_df.loc[target_cols, "MAE"] * pd.Series(w)).sum() / total_w)
 
@@ -267,6 +343,7 @@ def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
     if optuna is None:
         print("Optuna 미설치: 튜닝을 건너뜁니다.")
         return None
+
     def objective(trial):
         params = dict(
             objective="tweedie",
@@ -280,13 +357,19 @@ def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
             reg_lambda=trial.suggest_float("reg_lambda", 0.0, 20.0),
             random_state=args.seed,
         )
-        model = build_model_pipeline("lgbm", num_cols, cat_cols,
-                                     tweedie_power=params["tweedie_variance_power"],
-                                     alpha=0.5, lgbm_params=params)
-        _, mdf = train_validate(df, X, y, model, split=args.split, val_size=args.val_size,
-                                seed=args.seed, dt_col=args.dt_col, prod_col=args.prod_col,
-                                log_target=args.log_target)
+        model = build_model_pipeline(
+            "lgbm", num_cols, cat_cols,
+            tweedie_power=params["tweedie_variance_power"],
+            alpha=0.5, lgbm_params=params
+        )
+        _, mdf, _ = train_validate(
+            df, X, y, model,
+            split=args.split, val_size=args.val_size,
+            seed=args.seed, dt_col=args.dt_col, prod_col=args.prod_col,
+            log_target=args.log_target
+        )
         return average_mae(mdf, target_cols)
+
     study = optuna.create_study(direction="minimize")
     study.optimize(objective, n_trials=args.trials, show_progress_bar=False)
     print("Best params:", study.best_params)
@@ -310,6 +393,11 @@ def main():
     ap.add_argument("--deterministic", action="store_true")
     ap.add_argument("--best_params_path", default="./configs/best_params.json")
     ap.add_argument("--save_best_params", action="store_true")
+
+    # ---- NEW: MC options
+    ap.add_argument("--mc_scenarios", type=int, default=0, help="MC scenario count (0 disables)")
+    ap.add_argument("--mc_out", default=None, help="Path to save MC scenarios (.npz). default: <out>_mc.npz")
+
     args = ap.parse_args()
 
     df = pd.read_csv(args.inp)
@@ -323,7 +411,8 @@ def main():
             save_best_params(args.best_params_path, best_params)
     else:
         loaded = load_best_params(args.best_params_path)
-        if loaded: best_params = loaded
+        if loaded:
+            best_params = loaded
 
     reg_n_jobs = 1 if args.deterministic else -1
     if args.model == "lgbm":
@@ -342,8 +431,10 @@ def main():
             deterministic=args.deterministic,
             force_row_wise=args.deterministic,
         )
-        model = build_model_pipeline("lgbm", num_cols, cat_cols,
-                                     lgbm_params["tweedie_variance_power"], 0.5, lgbm_params, reg_n_jobs)
+        model = build_model_pipeline(
+            "lgbm", num_cols, cat_cols,
+            lgbm_params["tweedie_variance_power"], 0.5, lgbm_params, reg_n_jobs
+        )
         print("🔧 Final params:", lgbm_params)
     else:
         power = (best_params or {}).get("power", 1.3)
@@ -351,9 +442,12 @@ def main():
         model = build_model_pipeline("tweedie", num_cols, cat_cols, power, alpha, {}, reg_n_jobs)
         print("🔧 Final Tweedie params:", {"power": power, "alpha": alpha})
 
-    model, metrics_df = train_validate(df, X, y, model, split=args.split, val_size=args.val_size,
-                                       seed=args.seed, dt_col=args.dt_col, prod_col=args.prod_col,
-                                       log_target=args.log_target)
+    model, metrics_df, residuals = train_validate(
+        df, X, y, model,
+        split=args.split, val_size=args.val_size,
+        seed=args.seed, dt_col=args.dt_col, prod_col=args.prod_col,
+        log_target=args.log_target
+    )
     print("Validation metrics")
     print(metrics_df.to_string())
 
@@ -367,9 +461,31 @@ def main():
     pred_all.to_csv(args.out, index=False, encoding="utf-8-sig")
     print(f"예측 저장: {args.out}")
 
+    # ---- NEW: MC scenario generation & save
+    if args.mc_scenarios and args.mc_scenarios > 0:
+        d_hat = pred_all[target_cols].values.astype(float)  # (n, k)
+        scenarios = generate_demand_scenarios(
+            d_hat=d_hat,
+            residuals=residuals,
+            n_scenarios=args.mc_scenarios,
+            seed=args.seed,
+        )
+
+        mc_out = args.mc_out if args.mc_out is not None else args.out.replace(".csv", "_mc.npz")
+        Path(mc_out).parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            mc_out,
+            scenarios=scenarios,                # (S, n, k)
+            target_cols=np.array(target_cols),  # (k,)
+            prod_col=args.prod_col,
+            dt_col=args.dt_col,
+        )
+        print(f"MC scenarios saved: {mc_out}")
+
     prod_agg = aggregate_by_product(pred_all, args.prod_col)
-    prod_agg.to_csv(args.out.replace(".csv","_by_product.csv"), index=False, encoding="utf-8-sig")
-    print(f"제품별 평균 저장: {args.out.replace('.csv','_by_product.csv')}")
+    prod_agg_path = args.out.replace(".csv", "_by_product.csv")
+    prod_agg.to_csv(prod_agg_path, index=False, encoding="utf-8-sig")
+    print(f"제품별 평균 저장: {prod_agg_path}")
 
 if __name__ == "__main__":
     main()
