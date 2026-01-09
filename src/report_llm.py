@@ -1,4 +1,18 @@
 # src/report_llm.py
+# -*- coding: utf-8 -*-
+"""
+report_llm.py
+- production_plan.csv / forecast_by_product.csv / metrics_final.csv 기반 주간 리포트 생성
+- Facts(정량 집계)를 LLM에 제공 + Verifier Agent로 JSON 정합성 검증
+- (NEW) MC 검증 결과(mc_validation.json)를 Facts에 포함해 Canonical Markdown에 항상 표시
+
+중요 수정 사항
+1) _pick 함수가 중복 정의되어 기존 로직이 덮어씌워지는 버그 제거 (단일 정의로 통합)
+2) plan/feat/metrics 컬럼 선택 로직을 '정확일치→단어경계→부분문자열'로 안정화
+3) summarize_metrics: metrics_final.csv가 'horizon' 컬럼이 없고 index가 horizon일 수 있음 → 대응
+4) CLI에서 불필요하게 다시 facts 만들고 md를 덧붙이던 코드 제거 (build_report_with_llm 결과만 저장)
+5) mc_json이 summary만 주는/전체 dict 주는 케이스 모두 안전하게 처리
+"""
 
 import os
 import json
@@ -11,7 +25,6 @@ import pandas as pd
 import numpy as np
 import re
 
-
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, SystemMessage
 from dotenv import load_dotenv
@@ -21,44 +34,19 @@ load_dotenv()
 # =========================================================
 # 유틸
 # =========================================================
-def _pick(cols_map: Dict[str, str], cands: List[str]) -> Optional[str]:
-    """
-    컬럼 선택 우선순위:
-    1) 대소문자 무시 정확 일치
-    2) 단어 경계(\b) 일치
-    3) 부분문자열 일치 (product_number 오인방지)
-    """
-    keys = list(cols_map.keys())
-    lcands = [c.lower() for c in cands]
+WEIRD_SPACES = ["\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"]
 
-
-    for c in lcands:
-        for k in keys:
-            if k == c:
-                return cols_map[k]
-
-    for c in lcands:
-        pat = re.compile(rf"\b{re.escape(c)}\b")
-        for k in keys:
-            if pat.search(k):
-                return cols_map[k]
-
-    for c in lcands:
-        for k in keys:
-            if c in k:
-                if c in {"prod"} and "product_number" in k:
-                    continue
-                return cols_map[k]
-    return None
+def _clean_str(s: str) -> str:
+    s2 = str(s).strip()
+    for w in WEIRD_SPACES:
+        s2 = s2.replace(w, "")
+    s2 = re.sub(r"\s+", " ", s2).strip()
+    return s2
 
 def _dedup_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
-    clean = []
-    for c in df.columns:
-        s = str(c).strip().replace("\ufeff","").replace("\u200b","").replace("\u200c","").replace("\u200d","").replace("\xa0","")
-        clean.append(s)
-    df.columns = clean
+    df.columns = [_clean_str(c) for c in df.columns]
     if df.columns.duplicated().any():
         df = df.loc[:, ~df.columns.duplicated()].copy()
     return df
@@ -81,36 +69,51 @@ def _safe_float(x):
     except Exception:
         return 0.0
 
-def _topn(series: pd.Series, n: int = 5, largest=True) -> List[Tuple[str, float]]:
-    if series.empty:
+def _topn(series: pd.Series, n: int = 5, largest: bool = True) -> List[Tuple[str, float]]:
+    if series is None or getattr(series, "empty", True):
         return []
     ser = series.copy()
     ser = ser[~ser.isna()]
     if ser.empty:
         return []
-    ser = ser.sort_values(ascending=not largest)
-    ser = ser.iloc[:n]
+    ser = ser.sort_values(ascending=not largest).iloc[:n]
     return [(str(idx), float(val)) for idx, val in ser.items()]
 
 def _pick(cols_map: Dict[str, str], cands: List[str]) -> Optional[str]:
-    for k in cols_map:
-        if any(name.lower() in k for name in cands):
-            return cols_map[k]
+    """
+    컬럼 선택 우선순위:
+    1) 대소문자 무시 정확 일치
+    2) 단어 경계(\b) 일치
+    3) 부분문자열 일치 (prod/product_number 오인방지)
+    """
+    keys = list(cols_map.keys())
+    lcands = [str(c).lower() for c in cands]
+
+    # 1) exact
+    for c in lcands:
+        for k in keys:
+            if k == c:
+                return cols_map[k]
+
+    # 2) word boundary
+    for c in lcands:
+        pat = re.compile(rf"\b{re.escape(c)}\b")
+        for k in keys:
+            if pat.search(k):
+                return cols_map[k]
+
+    # 3) substring
+    for c in lcands:
+        for k in keys:
+            if c in k:
+                if c in {"prod"} and "product_number" in k:
+                    continue
+                return cols_map[k]
     return None
 
-def _coerce_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    real = [c for c in cols if c and c in df.columns]
-    for c in real:
-        if not pd.api.types.is_numeric_dtype(df[c]):
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    return df
-
-def _first_existing(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    for c in candidates:
-        if c in df.columns:
-            return c
-    return None
-
+# =========================================================
+# 1) Plan 요약 (제품별)
+# =========================================================
 def summarize_by_product(plan_csv: str, product_col_candidates=("product_number","product","제품")) -> Dict:
     """
     production_plan.csv를 제품 단위로 집계:
@@ -126,16 +129,17 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
     df = _dedup_columns(df)
     cols = {c.lower(): c for c in df.columns}
 
-    col_prodname = _pick(cols, list(product_col_candidates))                     # 제품 식별자
-    col_prodqty  = _pick(cols, ["produce","production","생산"])                  # 생산량
-    col_dem      = _pick(cols, ["demand","수요"])                                # 수요
-    col_back     = _pick(cols, ["backlog","백로그"])                             # 백로그
-    col_inv      = _pick(cols, ["end_inventory","inventory","inv","재고"])      # 재고
-         
+    col_prodname = _pick(cols, list(product_col_candidates))
+    col_prodqty  = _pick(cols, ["produce","production","생산"])
+    col_dem      = _pick(cols, ["demand","수요"])
+    col_back     = _pick(cols, ["backlog","백로그"])
+    col_inv      = _pick(cols, ["end_inventory","inventory","inv","재고"])
+
     print("[DEBUG] plan(by_product) columns:", list(df.columns))
     print("[DEBUG] picked(by_product) -> product:", col_prodname,
           "/ qty:", col_prodqty, "/ demand:", col_dem,
           "/ back:", col_back, "/ inv:", col_inv)
+
     required = [col_prodname, col_prodqty, col_dem]
     if any(x is None for x in required):
         return {
@@ -152,7 +156,6 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
         if c and c in df.columns and not pd.api.types.is_numeric_dtype(df[c]):
             df[c] = pd.to_numeric(df[c].astype(str).str.replace(",", ""), errors="coerce")
 
-    # 그룹 집계
     agg_dict = {col_prodqty: "sum", col_dem: "sum"}
     if col_back: agg_dict[col_back] = "sum"
     if col_inv:  agg_dict[col_inv]  = "sum"
@@ -164,66 +167,33 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
     if col_inv:  rename_map[col_inv]  = "end_inventory"
     grp = grp.rename(columns=rename_map)
 
-    if "Product_Number" in grp.columns:
-        grp["Product_Number"] = grp["Product_Number"].astype(str)
-
+    grp["Product_Number"] = grp["Product_Number"].astype(str)
     if "backlog" not in grp.columns:
         grp["backlog"] = 0.0
     if "end_inventory" not in grp.columns:
         grp["end_inventory"] = 0.0
 
-    # 지표
     grp["BacklogRate"] = grp["backlog"] / (grp["demand"] + 1e-9)
 
-    # Top 5 — 증산 필요(백로그 상위)
     top_backlog_df = grp.sort_values("backlog", ascending=False).head(5).copy()
-    top_backlog_df = _dedup_columns(top_backlog_df)
-    safe_cols_back = [c for c in ["Product_Number", "backlog", "BacklogRate"] if c in top_backlog_df.columns]
-    top_backlog = top_backlog_df[safe_cols_back].to_dict(orient="records")
+    top_backlog = top_backlog_df[["Product_Number", "backlog", "BacklogRate"]].to_dict(orient="records")
 
-    # Top 5 — 과다 생산(재고 상위; 재고가 모두 0이면 (produce - demand)+)
-    for c in ["produce", "demand", "end_inventory"]:
-        if c in grp.columns and not pd.api.types.is_numeric_dtype(grp[c]):
-            grp[c] = pd.to_numeric(grp[c], errors="coerce")
-
+    # overproduction score
     over_col = "_over_score"
-    over_score = grp["end_inventory"].fillna(0.0) if "end_inventory" in grp.columns else pd.Series(0.0, index=grp.index)
-    if float(over_score.fillna(0).sum()) == 0.0 and {"produce","demand"} <= set(grp.columns):
+    over_score = grp["end_inventory"].fillna(0.0)
+    if float(over_score.sum()) == 0.0 and {"produce","demand"} <= set(grp.columns):
         over_score = (grp["produce"].fillna(0.0) - grp["demand"].fillna(0.0)).clip(lower=0.0)
-
-    if len(over_score) != len(grp):
-        over_score = pd.Series(0.0, index=grp.index)
     grp[over_col] = over_score.fillna(0.0).astype(float)
 
-    if grp.columns.duplicated().any():
-        grp = grp.loc[:, ~grp.columns.duplicated()].copy()
-
     top_overprod_df = grp.sort_values(over_col, ascending=False).head(5).copy()
+    top_overprod = (top_overprod_df[["Product_Number", over_col]]
+                    .rename(columns={over_col: "over_score"})
+                    .to_dict(orient="records"))
 
-    safe_cols_over = [c for c in ["Product_Number", over_col] if c in top_overprod_df.columns]
-    if "Product_Number" not in safe_cols_over:
-        prod_fallback = next((c for c in top_overprod_df.columns if c.lower() in {"product_number","product","제품"}), None)
-        if prod_fallback:
-            safe_cols_over = [prod_fallback, over_col]
-            top_overprod = (top_overprod_df[safe_cols_over]
-                            .rename(columns={prod_fallback: "Product_Number", over_col: "over_score"})
-                            .to_dict(orient="records"))
-        else:
-            top_overprod_df = top_overprod_df.reset_index().rename(columns={"index":"Product_Number"})
-            safe_cols_over = ["Product_Number", over_col]
-            top_overprod = (top_overprod_df[safe_cols_over]
-                            .rename(columns={over_col: "over_score"})
-                            .to_dict(orient="records"))
-    else:
-        top_overprod = (top_overprod_df[safe_cols_over]
-                        .rename(columns={over_col: "over_score"})
-                        .to_dict(orient="records"))
-
-    # 프리뷰 테이블(상위 40행)
     preview_cols = [c for c in ["Product_Number","produce","demand","backlog","end_inventory","BacklogRate"] if c in grp.columns]
-    table_preview_df = grp.sort_values("backlog", ascending=False).head(40)[preview_cols].copy()
-    table_preview_df = _dedup_columns(table_preview_df)
-    table_preview = table_preview_df.to_dict(orient="records")
+    table_preview = (grp.sort_values("backlog", ascending=False)
+                       .head(40)[preview_cols]
+                       .to_dict(orient="records"))
 
     return {
         "missing": False,
@@ -234,75 +204,70 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
     }
 
 # =========================================================
-# 1) Plan 요약                            
+# 2) Plan 요약 (단일 plan)
 # =========================================================
 def _summarize_single_plan(plan_csv: str) -> Dict:
     if not _exists(plan_csv):
         return {"missing": True, "path": plan_csv}
 
     df = pd.read_csv(plan_csv)
+    df = _dedup_columns(df)
     cols = {c.lower(): c for c in df.columns}
 
     col_prod = _pick(cols, ["product_number", "product", "제품"])
     col_date = _pick(cols, ["date", "날짜", "horizon", "day", "day_idx"])
-    col_prod_qty = _pick(cols, ["생산", "production", "produce"])
-    col_inv = _pick(cols, ["재고", "inv", "inventory"])
-    col_backlog = _pick(cols, ["백로그", "backlog"])
+    col_prod_qty = _pick(cols, ["produce", "production", "생산"])
+    col_inv = _pick(cols, ["end_inventory", "inv", "inventory", "재고"])
+    col_backlog = _pick(cols, ["backlog", "백로그"])
     col_capa = _pick(cols, ["capa", "capacity"])
 
     print("[DEBUG] plan columns:", list(df.columns))
     print("[DEBUG] picked -> product:", col_prod, "/ date:", col_date,
-          "/ qty:", col_prod_qty, "/ inv:", col_inv, "/ back:", col_backlog, "/ capa:", col_capa)
-
-    if col_prod_qty == col_prod:
-        col_prod_qty = _pick(cols, ["produce", "production", "생산"])  # 이미 위에 있지만 재확인
-        if col_prod_qty == col_prod or col_prod_qty is None:
-            return {"missing": False, "schema_error": True, "columns": list(df.columns)}
+          "/ qty:", col_prod_qty, "/ inv:", col_inv,
+          "/ back:", col_backlog, "/ capa:", col_capa)
 
     required = [col_prod, col_prod_qty]
     if any(x is None for x in required):
         return {"missing": False, "schema_error": True, "columns": list(df.columns)}
 
-    if col_prod in df.columns:
-        df[col_prod] = df[col_prod].astype(str)
+    df[col_prod] = df[col_prod].astype(str)
 
     for c in [col_prod_qty, col_inv, col_backlog, col_capa]:
-        if c and not pd.api.types.is_numeric_dtype(df[c]):
+        if c and c in df.columns and not pd.api.types.is_numeric_dtype(df[c]):
             df[c] = df[c].apply(_safe_float)
 
     # 기간 정보
     period = {}
-    if col_date:
+    if col_date and col_date in df.columns:
         s = df[col_date].astype(str)
         period = {"min": str(s.min()), "max": str(s.max()), "n_points": int(len(s))}
 
-    # 총합 KPI
     total_prod = float(df[col_prod_qty].sum())
     total_inv = float(df[col_inv].sum()) if col_inv else 0.0
     total_backlog = float(df[col_backlog].sum()) if col_backlog else 0.0
     total_capa = float(df[col_capa].sum()) if col_capa else 0.0
 
-    n_days = None
     if col_date:
-        n_days = df[col_date].nunique()
+        n_days = int(df[col_date].nunique())
     elif "day_idx" in df.columns:
-        n_days = df["day_idx"].nunique()
+        n_days = int(df["day_idx"].nunique())
+    else:
+        n_days = None
+
     avg_daily_capa = float(total_capa / n_days) if (n_days and total_capa) else None
 
-    # 타임라인 총생산 & 변동성
-    prod_timeline = None
+    # 변동성
     if col_date:
         prod_timeline = df.groupby(col_date, dropna=False)[col_prod_qty].sum().sort_index()
         prod_variability = float(np.nanstd(prod_timeline.values)) if len(prod_timeline) else None
     else:
         prod_variability = None
 
-    # 평균 가동률(= 총생산/총CAPA)
     avg_utilization = float(total_prod / total_capa) if total_capa > 0 else None
     util_target = 0.9
     util_deviation = float(abs(avg_utilization - util_target)) if avg_utilization is not None else None
 
-    # 제품별 집계 (Top5)
+    # top5
     g = df.groupby(col_prod, dropna=False)
     prod_backlog_sum = g[col_backlog].sum() if col_backlog else pd.Series(dtype=float)
     prod_inv_sum = g[col_inv].sum() if col_inv else pd.Series(dtype=float)
@@ -315,18 +280,16 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
         approx = (prod_prod_sum - (prod_backlog_sum if not prod_backlog_sum.empty else 0.0))
         top_overprod = _topn(approx, n=5, largest=True)
 
-    # CAPA 충돌(생산 > CAPA) 비율
     capa_conflict_ratio = None
     if col_capa and col_date:
         day_prod = df.groupby(col_date)[col_prod_qty].sum()
         day_capa = df.groupby(col_date)[col_capa].sum()
         align = pd.concat([day_prod, day_capa], axis=1).dropna()
         if not align.empty:
-            conflict = (align.iloc[:, 0] > align.iloc[:, 1]).mean()
-            capa_conflict_ratio = float(conflict)
+            capa_conflict_ratio = float((align.iloc[:, 0] > align.iloc[:, 1]).mean())
 
     print("[DEBUG] totals -> prod:", total_prod, "inv:", total_inv,
-      "backlog:", total_backlog, "capa:", total_capa, "avg_daily_capa:", avg_daily_capa)
+          "backlog:", total_backlog, "capa:", total_capa, "avg_daily_capa:", avg_daily_capa)
 
     return {
         "missing": False,
@@ -337,8 +300,8 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
             "total_inventory": total_inv,
             "total_backlog": total_backlog,
             "total_capa": total_capa,
-            "avg_daily_capa": avg_daily_capa,  
-            "n_days": int(n_days) if n_days else None  # (원하면 함께 전달)
+            "avg_daily_capa": avg_daily_capa,
+            "n_days": n_days
         },
         "timeline": {
             "production_variability": prod_variability,
@@ -357,27 +320,20 @@ def summarize_cluster_kpi(plan_csv: str, feat_csv: str) -> dict:
     feat.csv의 cluster(0~3)와 production_plan.csv를 Product_Number 기준으로 매칭해
     클러스터별 KPI(총 생산량, 재고, 백로그, CAPA, 평균 활용도)를 계산한다.
     """
-    import pandas as pd, numpy as np, os
-    if not (os.path.exists(plan_csv) and os.path.exists(feat_csv)):
+    if not (_exists(plan_csv) and _exists(feat_csv)):
         return {"missing": True, "reason": "file not found", "paths": [plan_csv, feat_csv]}
 
-    plan = pd.read_csv(plan_csv)
-    feat = pd.read_csv(feat_csv)
-
-    def _dedup(df):
-        if df.columns.duplicated().any():
-            df = df.loc[:, ~df.columns.duplicated()].copy()
-        df.columns = [str(c).strip() for c in df.columns]
-        return df
-    plan = _dedup(plan); feat = _dedup(feat)
+    plan = _dedup_columns(pd.read_csv(plan_csv))
+    feat = _dedup_columns(pd.read_csv(feat_csv))
 
     def _pick_key(df):
         lc = {c.lower(): c for c in df.columns}
         for k in ["product_number", "product", "제품"]:
-            if k in lc: return lc[k]
-        # 부분문자열 fallback
+            if k in lc:
+                return lc[k]
         for c in lc:
-            if "product" in c: return lc[c]
+            if "product" in c:
+                return lc[c]
         return None
 
     key_plan = _pick_key(plan)
@@ -386,10 +342,7 @@ def summarize_cluster_kpi(plan_csv: str, feat_csv: str) -> dict:
         return {"missing": False, "schema_error": True, "reason": "key not found",
                 "plan_cols": list(plan.columns), "feat_cols": list(feat.columns)}
 
-    cl_col = None
-    for c in feat.columns:
-        if c.lower() == "cluster":
-            cl_col = c; break
+    cl_col = next((c for c in feat.columns if c.lower() == "cluster"), None)
     if cl_col is None:
         return {"missing": False, "schema_error": True, "reason": "cluster col not found",
                 "feat_cols": list(feat.columns)}
@@ -402,7 +355,6 @@ def summarize_cluster_kpi(plan_csv: str, feat_csv: str) -> dict:
             plan[c] = pd.to_numeric(plan[c].astype(str).str.replace(",", ""), errors="coerce")
 
     merged = plan.merge(feat[[key_feat, cl_col]], left_on=key_plan, right_on=key_feat, how="left")
-
     merged[cl_col] = pd.to_numeric(merged[cl_col], errors="coerce")
     merged = merged[~merged[cl_col].isna()].copy()
     merged[cl_col] = merged[cl_col].astype(int)
@@ -411,13 +363,10 @@ def summarize_cluster_kpi(plan_csv: str, feat_csv: str) -> dict:
         return {"missing": True, "reason": "no rows after merge"}
 
     grp = (merged.groupby(cl_col)[["produce", "end_inventory", "backlog", "capa"]]
-                  .sum(numeric_only=True)
-                  .reset_index()
-                  .rename(columns={cl_col: "cluster"}))
-    if "capa" in grp.columns:
-        grp["utilization"] = grp["produce"] / grp["capa"].replace({0: np.nan})
-    else:
-        grp["utilization"] = np.nan
+           .sum(numeric_only=True).reset_index()
+           .rename(columns={cl_col: "cluster"}))
+
+    grp["utilization"] = grp["produce"] / grp["capa"].replace({0: np.nan}) if "capa" in grp.columns else np.nan
 
     labels = {
         0: "비활발(저수요/저생산)",
@@ -430,11 +379,6 @@ def summarize_cluster_kpi(plan_csv: str, feat_csv: str) -> dict:
     return {"missing": False, "schema_error": False, "table": grp.to_dict(orient="records")}
 
 def _pareto_frontier(items: List[Dict]) -> List[int]:
-    """
-    items: [{"backlog": float, "variability": float, "util_dev": float}, ...]
-    최소화 기준 3개(backlog, variability, util_dev)로 파레토 비지배 해 찾기.
-    반환: 파레토 인덱스 리스트(원본 순서 기준)
-    """
     if not items:
         return []
     dominated = set()
@@ -445,14 +389,14 @@ def _pareto_frontier(items: List[Dict]) -> List[int]:
             if i == j or j in dominated:
                 continue
             conds = [
-                b["backlog"] <= a["backlog"] if a["backlog"] is not None and b["backlog"] is not None else False,
-                b["variability"] <= a["variability"] if a["variability"] is not None and b["variability"] is not None else False,
-                b["util_dev"] <= a["util_dev"] if a["util_dev"] is not None and b["util_dev"] is not None else False,
+                (b["backlog"] <= a["backlog"]) if (a["backlog"] is not None and b["backlog"] is not None) else False,
+                (b["variability"] <= a["variability"]) if (a["variability"] is not None and b["variability"] is not None) else False,
+                (b["util_dev"] <= a["util_dev"]) if (a["util_dev"] is not None and b["util_dev"] is not None) else False,
             ]
             strict = [
-                b["backlog"] < a["backlog"] if a["backlog"] is not None and b["backlog"] is not None else False,
-                b["variability"] < a["variability"] if a["variability"] is not None and b["variability"] is not None else False,
-                b["util_dev"] < a["util_dev"] if a["util_dev"] is not None and b["util_dev"] is not None else False,
+                (b["backlog"] < a["backlog"]) if (a["backlog"] is not None and b["backlog"] is not None) else False,
+                (b["variability"] < a["variability"]) if (a["variability"] is not None and b["variability"] is not None) else False,
+                (b["util_dev"] < a["util_dev"]) if (a["util_dev"] is not None and b["util_dev"] is not None) else False,
             ]
             if all(conds) and any(strict):
                 dominated.add(i)
@@ -460,16 +404,12 @@ def _pareto_frontier(items: List[Dict]) -> List[int]:
     return [i for i in range(len(items)) if i not in dominated]
 
 def summarize_plans(plans: List[str], names: Optional[List[str]] = None) -> Dict:
-    """
-    복수 시나리오의 production_plan.csv 요약 + Pareto.
-    """
     names = names or [f"scenario_{i+1}" for i in range(len(plans))]
     per = []
     for p, nm in zip(plans, names):
         s = _summarize_single_plan(p)
         per.append({"name": nm, "path": p, "summary": s})
 
-    # Pareto용 포인트 구성
     pts = []
     for it in per:
         s = it["summary"]
@@ -485,42 +425,69 @@ def summarize_plans(plans: List[str], names: Optional[List[str]] = None) -> Dict
     return {"scenarios": per}
 
 # =========================================================
-# 2) Metrics / Forecast 요약
+# 3) Metrics / Forecast 요약
 # =========================================================
 def summarize_metrics(metrics_csv: str) -> Dict:
+    """
+    forecast.py에서 저장되는 metrics_final.csv는 보통:
+      - index가 horizon(예: 'T일 예상 수주량')이고
+      - columns: MAE, RMSE, R2, SMAPE, ...
+    일 수도 있고,
+      - horizon 컬럼이 따로 있을 수도 있음.
+    둘 다 지원.
+    """
     if not _exists(metrics_csv):
         return {"missing": True, "path": metrics_csv}
-    df = pd.read_csv(metrics_csv)
-    cols = {c.lower(): c for c in df.columns}
-    def pick(name):
-        for k in cols:
-            if name in k:
-                return cols[k]
-        return None
-    col_h = pick("horizon")
-    col_mae = pick("mae")
-    col_r2 = pick("r2")
-    if not col_h or not col_mae or not col_r2:
-        return {"missing": False, "schema_error": True, "columns": list(df.columns)}
 
-    df = df[[col_h, col_mae, col_r2]].copy()
-    df.columns = ["horizon", "mae", "r2"]
-    df["mae"] = pd.to_numeric(df["mae"], errors="coerce")
-    df["r2"] = pd.to_numeric(df["r2"], errors="coerce")
+    df = pd.read_csv(metrics_csv)
+    df = _dedup_columns(df)
+
+    # case A: horizon 컬럼이 존재
+    cols = {c.lower(): c for c in df.columns}
+    col_h = _pick(cols, ["horizon", "target", "label", "기간", "예상"])
+    col_mae = _pick(cols, ["mae"])
+    col_r2 = _pick(cols, ["r2"])
+
+    if col_h and col_mae and col_r2:
+        tmp = df[[col_h, col_mae, col_r2]].copy()
+        tmp.columns = ["horizon", "mae", "r2"]
+    else:
+        # case B: horizon이 index로 저장된 형태 (첫 컬럼이 index였던 경우)
+        # 흔한 케이스: 첫 컬럼 이름이 Unnamed: 0 또는 비어있음
+        first = df.columns[0]
+        if first.lower().startswith("unnamed") or first.strip() == "":
+            df = df.rename(columns={first: "horizon"})
+            col_h = "horizon"
+        else:
+            col_h = first  # 그래도 첫 컬럼을 horizon으로 가정
+
+        # mae/r2 컬럼 찾기
+        cols2 = {c.lower(): c for c in df.columns}
+        col_mae = cols2.get("mae", _pick(cols2, ["mae"]))
+        col_r2 = cols2.get("r2", _pick(cols2, ["r2"]))
+
+        if not (col_h and col_mae and col_r2):
+            return {"missing": False, "schema_error": True, "columns": list(df.columns)}
+
+        tmp = df[[col_h, col_mae, col_r2]].copy()
+        tmp.columns = ["horizon", "mae", "r2"]
+
+    tmp["mae"] = pd.to_numeric(tmp["mae"], errors="coerce")
+    tmp["r2"] = pd.to_numeric(tmp["r2"], errors="coerce")
 
     out = {
-        "by_horizon": df.sort_values("horizon").to_dict(orient="records"),
-        "avg_mae": float(df["mae"].mean(skipna=True)),
-        "avg_r2": float(df["r2"].mean(skipna=True)),
+        "by_horizon": tmp.sort_values("horizon").to_dict(orient="records"),
+        "avg_mae": float(tmp["mae"].mean(skipna=True)),
+        "avg_r2": float(tmp["r2"].mean(skipna=True)),
         "best_horizon_by_r2": None,
         "best_horizon_by_mae": None,
     }
     try:
-        out["best_horizon_by_r2"] = df.loc[df["r2"].idxmax(), "horizon"]
+        out["best_horizon_by_r2"] = tmp.loc[tmp["r2"].idxmax(), "horizon"]
     except Exception:
         pass
     try:
-        out["best_horizon_by_mae"] = df.loc[df["mae"].idxmin(), "horizon"]
+        out["best_horizon_by_mae"] = tmp.loc[tmp["mae"].idxmin(), "horizon"]
     except Exception:
         pass
     return out
@@ -528,7 +495,7 @@ def summarize_metrics(metrics_csv: str) -> Dict:
 def summarize_forecast_by_product(forecast_csv: str) -> Dict:
     if not _exists(forecast_csv):
         return {"missing": True, "path": forecast_csv}
-    df = pd.read_csv(forecast_csv)
+    df = _dedup_columns(pd.read_csv(forecast_csv))
     n_rows, n_cols = df.shape
     numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
     stats = {}
@@ -539,14 +506,10 @@ def summarize_forecast_by_product(forecast_csv: str) -> Dict:
             "p50": float(s.quantile(0.5)),
             "p90": float(s.quantile(0.9)),
         }
-    return {
-        "shape": [int(n_rows), int(n_cols)],
-        "numeric_stats": stats,
-        "columns": list(df.columns),
-    }
+    return {"shape": [int(n_rows), int(n_cols)], "numeric_stats": stats, "columns": list(df.columns)}
 
 # =========================================================
-# 3) Prompt / LLM 호출
+# 4) Prompt / LLM 호출
 # =========================================================
 SYS_PROMPT = (
     "You are an operations planning analyst AI.\n"
@@ -638,7 +601,6 @@ class LLMConfig:
     retry_backoff_sec: float = 2.5
 
 def _call_llm(messages, cfg: LLMConfig) -> str:
-    import os, time
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 환경변수를 설정하세요.")
@@ -679,7 +641,7 @@ def _split_json_markdown(raw: str) -> Tuple[Optional[dict], str]:
     return json_obj, md
 
 # =========================================================
-# 4) Verifier Agent
+# 5) Verifier Agent
 # =========================================================
 def verify_report(model_json: dict, facts: dict, cfg: LLMConfig) -> Dict:
     sys = SystemMessage(content="You are a strict QA verifier.")
@@ -692,12 +654,7 @@ def verify_report(model_json: dict, facts: dict, cfg: LLMConfig) -> Dict:
     return {"ok": ok, "report": out.strip()}
 
 def _render_canonical_md(facts: dict) -> str:
-    """
-    FACTS(집계 수치)를 그대로 보여주는 Canonical Markdown.
-    LLM 결과와 무관하게 항상 앞에 붙여 신뢰할 수 있는 KPI/TopN/클러스터 표를 보장.
-    """
     import math
-    import pandas as pd
 
     def _fmt(x, nd=1):
         try:
@@ -709,14 +666,14 @@ def _render_canonical_md(facts: dict) -> str:
         except Exception:
             return str(x)
 
-    md = []  
+    md: List[str] = []
 
-    # 대표 시나리오 요약
     rep = facts.get("plan_summary_rep") or {}
     totals = rep.get("totals") or {}
     period = rep.get("period") or {}
     period_min = period.get("min")
     period_max = period.get("max")
+
     total_prod = totals.get("total_production", 0.0)
     total_inv  = totals.get("total_inventory", 0.0)
     total_back = totals.get("total_backlog", 0.0)
@@ -728,34 +685,35 @@ def _render_canonical_md(facts: dict) -> str:
     md.append("- **KPI 요약**")
     if period_min is not None or period_max is not None:
         md.append(f"  - 기간: {period_min} ~ {period_max}")
-    md.append(f"  - 총 생산량: { _fmt(total_prod, 1) }")
-    md.append(f"  - 총 재고: { _fmt(total_inv, 1) }")
-    md.append(f"  - 총 백로그: { _fmt(total_back, 1) }")
+    md.append(f"  - 총 생산량: {_fmt(total_prod, 1)}")
+    md.append(f"  - 총 재고: {_fmt(total_inv, 1)}")
+    md.append(f"  - 총 백로그: {_fmt(total_back, 1)}")
     if avg_capa is not None:
-        md.append(f"  - 평균 일일 CAPA: { _fmt(avg_capa, 1) }")
+        md.append(f"  - 평균 일일 CAPA: {_fmt(avg_capa, 1)}")
     if total_capa:
-        md.append(f"  - 총 CAPA(합계): { _fmt(total_capa, 1) }")
+        md.append(f"  - 총 CAPA(합계): {_fmt(total_capa, 1)}")
     md.append("")
+
     mc = facts.get("mc_validation") or None
     if isinstance(mc, dict) and mc:
-        # summary만 들어오는 경우/전체 dict 들어오는 경우 둘 다 대비
         s = mc.get("summary", mc)
-
         md.append("## Monte Carlo 검증 요약")
-        if isinstance(s.get("BacklogRate"), dict):
+        br = s.get("BacklogRate")
+        if isinstance(br, dict):
             md.append(
                 f"- BacklogRate(mean/p90/max): "
-                f"{s['BacklogRate'].get('mean', 0.0):.4f} / "
-                f"{s['BacklogRate'].get('p90', 0.0):.4f} / "
-                f"{s['BacklogRate'].get('max', 0.0):.4f}"
+                f"{float(br.get('mean', 0.0)):.4f} / {float(br.get('p90', 0.0)):.4f} / {float(br.get('max', 0.0)):.4f}"
             )
         md.append(f"- FailRate: {float(s.get('FailRate', 0.0)):.4f}")
+        if "n_scenarios" in s:
+            md.append(f"- 시나리오 수: {int(s.get('n_scenarios', 0))}")
         md.append("")
+
     md.append("### 행동 계획 (정량 기반)")
     for act in facts.get("rule_based_actions", []):
         md.append(f"- {act}")
+    md.append("")
 
-    # 제품 Top5 (FACTS 그대로)
     ps = facts.get("product_summary") or {}
     top_inc  = ps.get("top_backlog", []) or []
     top_over = ps.get("top_overprod", []) or []
@@ -765,7 +723,7 @@ def _render_canonical_md(facts: dict) -> str:
         for d in top_inc:
             name = d.get("Product_Number", "?")
             val  = d.get("backlog", d.get("sum_backlog", 0))
-            md.append(f"  - {name}: { _fmt(val, 1) }")
+            md.append(f"  - {name}: {_fmt(val, 1)}")
     else:
         md.append("  - (데이터 없음)")
     md.append("")
@@ -775,12 +733,11 @@ def _render_canonical_md(facts: dict) -> str:
         for d in top_over:
             name = d.get("Product_Number", "?")
             val  = d.get("over_score", 0)
-            md.append(f"  - {name}: { _fmt(val, 1) }")
+            md.append(f"  - {name}: {_fmt(val, 1)}")
     else:
         md.append("  - (데이터 없음)")
     md.append("")
 
-    # 예측 메트릭 
     ms = facts.get("metrics_summary") or {}
     rows = []
     for r in (ms.get("by_horizon") or []):
@@ -788,10 +745,9 @@ def _render_canonical_md(facts: dict) -> str:
     if rows:
         md.append("- **예상 수주량 지표**")
         for h, mae, r2 in rows:
-            md.append(f"  - {h} MAE: { _fmt(mae, 4) }, R2: { _fmt(r2, 4) }")
+            md.append(f"  - {h} MAE: {_fmt(mae, 4)}, R2: {_fmt(r2, 4)}")
         md.append("")
 
-    # 시나리오 비교 
     scs = facts.get("plan_scenarios", {}).get("scenarios", [])
     if scs:
         md.append("- **시나리오 비교**")
@@ -802,14 +758,10 @@ def _render_canonical_md(facts: dict) -> str:
             s = it.get("summary", {}) or {}
             tt = s.get("totals", {}) or {}
             tl = s.get("timeline", {}) or {}
-            row = [
-                name,
-                _fmt(tt.get("total_backlog"), 1),
-                _fmt(tl.get("production_variability"), 2),
-                _fmt(tl.get("avg_utilization"), 2),
-                "예" if it.get("pareto_frontier") else "아니오"
-            ]
-            md.append(f"  | {row[0]} | {row[1]} | {row[2]} | {row[3]} | {row[4]} |")
+            md.append(
+                f"  | {name} | {_fmt(tt.get('total_backlog'), 1)} | {_fmt(tl.get('production_variability'), 2)} | "
+                f"{_fmt(tl.get('avg_utilization'), 2)} | {'예' if it.get('pareto_frontier') else '아니오'} |"
+            )
         md.append("")
 
     cluster = facts.get("cluster_summary") or {}
@@ -821,9 +773,10 @@ def _render_canonical_md(facts: dict) -> str:
                 md.append("  | 클러스터 | 유형 | 총 생산량 | 총 재고 | 총 백로그 | 평균 활용도 |")
                 md.append("  |---:|---|---:|---:|---:|---:|")
                 for _, r in dfc.iterrows():
-                    md.append(f"  | {int(r['cluster'])} | {r.get('label','')} | "
-                              f"{_fmt(r.get('produce',0),1)} | {_fmt(r.get('end_inventory',0),1)} | "
-                              f"{_fmt(r.get('backlog',0),1)} | {_fmt(r.get('utilization',float('nan')),2)} |")
+                    md.append(
+                        f"  | {int(r['cluster'])} | {r.get('label','')} | {_fmt(r.get('produce',0),1)} | "
+                        f"{_fmt(r.get('end_inventory',0),1)} | {_fmt(r.get('backlog',0),1)} | {_fmt(r.get('utilization',float('nan')),2)} |"
+                    )
                 md.append("")
         except Exception as e:
             md.append(f"_클러스터 표 생성 중 오류: {e}_")
@@ -831,32 +784,20 @@ def _render_canonical_md(facts: dict) -> str:
     return "\n".join(md)
 
 def _enforce_facts_on_json(js: dict, facts: dict) -> dict:
-    """LLM JSON을 Facts로 강제 정합. 누락/불일치 수치를 사실값으로 덮어씀."""
     if not isinstance(js, dict):
         return js
 
     rep = (facts.get("plan_summary_rep") or {})
     totals = rep.get("totals") or {}
     js.setdefault("summary", {})
-    for k_fact, k_js in [
-        ("total_production", "total_production"),
-        ("total_inventory", "total_inventory"),
-        ("total_backlog", "total_backlog"),
-        ("avg_daily_capa", "avg_daily_capa"),
-    ]:
-        v = totals.get(k_fact, None)
+    for k in ["total_production", "total_inventory", "total_backlog", "avg_daily_capa"]:
+        v = totals.get(k, None)
         if v is not None:
-            js["summary"][k_js] = v
+            js["summary"][k] = v
 
     period = rep.get("period") or {}
-    if "period_min" in js.get("summary", {}):
-        js["summary"]["period_min"] = period.get("min")
-    else:
-        js["summary"].setdefault("period_min", period.get("min"))
-    if "period_max" in js.get("summary", {}):
-        js["summary"]["period_max"] = period.get("max")
-    else:
-        js["summary"].setdefault("period_max", period.get("max"))
+    js["summary"]["period_min"] = period.get("min")
+    js["summary"]["period_max"] = period.get("max")
 
     ps = facts.get("product_summary") or {}
     inc = ps.get("top_backlog") or []
@@ -871,7 +812,6 @@ def _enforce_facts_on_json(js: dict, facts: dict) -> dict:
         for d in over
     ]
 
-    # 시나리오 비교: Facts 그대로 사용
     sc = facts.get("plan_scenarios", {}).get("scenarios", [])
     table = []
     for it in sc:
@@ -887,14 +827,11 @@ def _enforce_facts_on_json(js: dict, facts: dict) -> dict:
         })
     js.setdefault("scenario_compare", {})
     js["scenario_compare"]["table"] = table
+
     return js
 
 def generate_rule_based_actions(facts: dict) -> List[str]:
-    """
-    정량지표 기반 행동 계획 자동 생성.
-    Facts에는 plan_summary_rep, product_summary, metrics_summary 등이 포함됨.
-    """
-    actions = []
+    actions: List[str] = []
     plan = facts.get("plan_summary_rep", {}).get("timeline", {})
     totals = facts.get("plan_summary_rep", {}).get("totals", {})
     product_sum = facts.get("product_summary", {})
@@ -904,34 +841,28 @@ def generate_rule_based_actions(facts: dict) -> List[str]:
     total_backlog = totals.get("total_backlog", 0.0)
     total_inv = totals.get("total_inventory", 0.0)
 
-    # --- 1. 라인 가동률 저조 ---
     if avg_util is not None and avg_util < 0.8:
         actions.append("라인 가동률 제고를 위해 CAPA 재배분 또는 잔업 계획 검토")
 
-    # --- 2. Top5 backlog 집중도 ---
     if product_sum and not product_sum.get("missing"):
         top5 = product_sum.get("top_backlog", [])
         if top5 and total_backlog:
-            ratio = sum(item.get("backlog", 0) for item in top5) / total_backlog
+            ratio = sum(float(item.get("backlog", 0)) for item in top5) / float(total_backlog)
             if ratio > 0.6:
                 actions.append("상위 소수 품목에 대한 집중 생산 전략 수립")
 
-    # --- 3. 생산 변동성 ---
-    if prod_var is not None and prod_var > 500:  # θ=500
+    if prod_var is not None and prod_var > 500:
         actions.append("일별 생산 변동성을 완화하기 위한 생산 스무딩/캠페인 조정")
 
-    # --- 4. 과잉 재고 ---
-    if total_inv > 10000:  # 임계치: 데이터 규모에 따라 조정
+    if total_inv > 10000:
         actions.append("과잉 재고 감축 및 프로모션 전략 검토")
 
-    # --- 5. 기본 fallback ---
     if not actions:
         actions.append("주요 지표 이상 없음 — 계획 유지 및 예측 모니터링 지속")
 
     return actions
 
 def _autoresolve_feat_path(feat_csv: str, plan_path: Optional[str]) -> str:
-    """명시한 feat_csv가 없으면 plan 주변/관용 경로에서 자동 탐색."""
     if feat_csv and os.path.exists(feat_csv):
         return feat_csv
     cands = []
@@ -951,16 +882,16 @@ def _autoresolve_feat_path(feat_csv: str, plan_path: Optional[str]) -> str:
             print(f"[DEBUG] auto-picked feat.csv -> {p}")
             return p
     print("[DEBUG] feat.csv not found in common locations:", cands)
-    return "" 
+    return ""
+
 # =========================================================
-# 5) 메인 엔드포인트
+# 6) 메인 엔드포인트
 # =========================================================
 def build_report_with_llm(
     plan_csv: str = "",
     forecast_csv: str = "",
     metrics_csv: str = "",
     mc_json: str = "",
-    # 복수 시나리오 입력
     plan_csvs: Optional[List[str]] = None,
     scenario_names: Optional[List[str]] = None,
     model_name: str = "gpt-4o-mini",
@@ -970,11 +901,11 @@ def build_report_with_llm(
     auto_regen_on_fail: bool = True
 ) -> Dict:
     """
-    반환: {"json": <구조화 결과 or None>, "markdown": <문서 or None>, "raw": <LLM원문>, "verify": {...}, "regen": bool}
+    반환: {"json": <구조화 결과 or None>, "markdown": <문서>, "raw": <LLM원문>, "verify": {...}, "regen": bool}
     """
     cfg = LLMConfig(model=model_name)
 
-    # ----- Plans (단일 또는 다중)
+    # Plans
     if plan_csvs and len(plan_csvs) > 0:
         plans = plan_csvs
     elif plan_csv:
@@ -985,7 +916,6 @@ def build_report_with_llm(
     plans_summary = summarize_plans(plans, names=scenario_names) if plans else {"scenarios": []}
     rep_sum = plans_summary["scenarios"][0]["summary"] if plans_summary["scenarios"] else {}
 
-    # ----- Metrics / Forecast
     metrics_sum = summarize_metrics(metrics_csv) if metrics_csv else {}
     forecast_sum = summarize_forecast_by_product(forecast_csv) if forecast_csv else {}
 
@@ -994,42 +924,33 @@ def build_report_with_llm(
     cluster_summary = summarize_cluster_kpi(plans[0], feat_path) if (plans and feat_path) else {"missing": True, "reason": "feat path unresolved"}
     print("[DEBUG] cluster_summary.flags:", {k: cluster_summary.get(k) for k in ["missing","schema_error","reason"]})
 
-    facts = {
-        "plan_scenarios": plans_summary,     
-        "plan_summary_rep": rep_sum,         
-        "metrics_summary": metrics_sum,
-        "forecast_summary": forecast_sum,
-        "product_summary": product_summary,
-        "cluster_summary": cluster_summary,
-    }
-    facts["rule_based_actions"] = generate_rule_based_actions(facts)
     mc_summary = None
     if mc_json and os.path.exists(mc_json):
         with open(mc_json, "r", encoding="utf-8") as f:
             mc_summary = json.load(f)
 
-    facts["mc_validation"] = mc_summary
-                        
+    facts = {
+        "plan_scenarios": plans_summary,
+        "plan_summary_rep": rep_sum,
+        "metrics_summary": metrics_sum,
+        "forecast_summary": forecast_sum,
+        "product_summary": product_summary,
+        "cluster_summary": cluster_summary,
+        "mc_validation": mc_summary,
+    }
+    facts["rule_based_actions"] = generate_rule_based_actions(facts)
+
     print("[DEBUG] actions:", facts.get("rule_based_actions"))
 
-    samples = []
+    samples: List[str] = []
     if plans:
-        for nm, p in zip(scenario_names or [f"scenario_{i+1}" for i in range(len(plans))], plans):
-            samples.append(f"[PRODUCTION_PLAN: {nm}]\n{_read_clip_csv(p, max_rows=max_head_rows, max_chars=max_chars)}")
+        use_names = scenario_names or [f"scenario_{i+1}" for i in range(len(plans))]
+        for nm, pth in zip(use_names, plans):
+            samples.append(f"[PRODUCTION_PLAN: {nm}]\n{_read_clip_csv(pth, max_rows=max_head_rows, max_chars=max_chars)}")
     if forecast_csv:
         samples.append(f"[FORECAST_BY_PRODUCT]\n{_read_clip_csv(forecast_csv, max_rows=max_head_rows, max_chars=max_chars)}")
     if metrics_csv:
         samples.append(f"[FORECAST_METRICS]\n{_read_clip_csv(metrics_csv, max_rows=max_head_rows, max_chars=max_chars)}")
-    if product_summary and not product_summary.get("missing") and not product_summary.get("schema_error"):
-        try:
-            df_preview = pd.DataFrame(product_summary.get("table_head", []))
-            if not df_preview.empty:
-                txt = df_preview.to_csv(index=False)
-                if len(txt) > max_chars:
-                    txt = txt[:max_chars] + f"\n...[truncated to {max_chars} chars]"
-                samples.append(f"[PRODUCT_SUMMARY_BY_ITEM]\n{txt}")
-        except Exception:
-            pass
 
     sys = SystemMessage(content=SYS_PROMPT)
     user = HumanMessage(content=USER_TASK.format(
@@ -1041,12 +962,10 @@ def build_report_with_llm(
     js, md = _split_json_markdown(raw)
     if js is not None:
         js = _enforce_facts_on_json(js, facts)
+
     canonical = _render_canonical_md(facts)
-    if md:
-        md = canonical + "\n\n---\n\n" + md
-    else:
-        md = canonical
-    # ----- Verifier Agent
+    md = canonical + ("\n\n---\n\n" + md if md else "")
+
     verification = {"ok": True, "report": "OK"}
     regen = False
     if js is not None:
@@ -1063,25 +982,27 @@ def build_report_with_llm(
             ))
             raw2 = _call_llm([sys, reflect_user], cfg)
             js2, md2 = _split_json_markdown(raw2)
-            raw, js, md = raw2, js2, md2
+            raw, js = raw2, js2
+            if js is not None:
+                js = _enforce_facts_on_json(js, facts)
+            md = canonical + ("\n\n---\n\n" + (md2 or "") if (md2 or "") else "")
             regen = True
             verification = verify_report(js if js else {}, facts, cfg)
 
     return {"json": js, "markdown": md, "raw": raw, "verify": verification, "regen": regen}
 
+# =========================================================
+# 7) CLI
+# =========================================================
 from pathlib import Path
 
 def _ensure_parent_dir(path: str):
     p = Path(path)
-    if p.parent: 
+    if p.parent:
         p.parent.mkdir(parents=True, exist_ok=True)
 
-# =========================================================
-# 6) CLI
-# =========================================================
 def main():
     p = argparse.ArgumentParser(description="Weekly report generator (LLM-augmented, with Verifier & Scenarios)")
-
     p.add_argument("--plan", help="production_plan.csv 경로 (단일)")
     p.add_argument("--plans", help="쉼표(,)로 구분된 production_plan.csv 경로 목록")
     p.add_argument("--scenario_names", help="쉼표(,)로 구분된 시나리오 이름 목록 (plans와 동일 길이)")
@@ -1096,12 +1017,8 @@ def main():
     p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로")
     args = p.parse_args()
 
-    plans = []
-    names = None
-    if args.plans:
-        plans = [s.strip() for s in args.plans.split(",") if s.strip()]
-    if args.scenario_names:
-        names = [s.strip() for s in args.scenario_names.split(",") if s.strip()]
+    plans = [s.strip() for s in args.plans.split(",") if s.strip()] if args.plans else []
+    names = [s.strip() for s in args.scenario_names.split(",") if s.strip()] if args.scenario_names else None
 
     out = build_report_with_llm(
         plan_csv=args.plan or "",
@@ -1112,41 +1029,20 @@ def main():
         model_name=args.model,
         feat_csv=args.feat or "",
         auto_regen_on_fail=not args.no_regen,
-        mc_json=args.mc_json,
+        mc_json=args.mc_json or "",
     )
-    md = out.get("markdown") or ""
-    ps = out.get("json")  
 
-    try:
-        psum = out and "product_summary"  
-    except:
-        psum = None
-
-    facts = {
-        "plan_scenarios": summarize_plans([args.plan]) if args.plan else {"scenarios":[]},
-        "product_summary": summarize_by_product(args.plan) if args.plan else {},
-    }
-    prod_head = facts["product_summary"].get("table_head", [])
-    if prod_head:
-        dfp = pd.DataFrame(prod_head)
-        md += "\n\n### 제품별 요약 (상위 40행 프리뷰)\n"
-        md += "| " + " | ".join(dfp.columns) + " |\n"
-        md += "| " + " | ".join(["---"]*len(dfp.columns)) + " |\n"
-        for _, r in dfp.iterrows():
-            md += "| " + " | ".join([f"{r[c]}" for c in dfp.columns]) + " |\n"
-
-    # 저장
-    if out.get("markdown"):
+    if out.get("markdown") is not None:
         _ensure_parent_dir(args.out_md)
         with open(args.out_md, "w", encoding="utf-8") as f:
-            f.write(md)
+            f.write(out["markdown"])
 
     if out.get("json") is not None:
         _ensure_parent_dir(args.out_json)
         with open(args.out_json, "w", encoding="utf-8") as f:
             json.dump(out["json"], f, ensure_ascii=False, indent=2)
 
-    if out.get("verify"):
+    if out.get("verify") is not None:
         _ensure_parent_dir(args.out_verify)
         with open(args.out_verify, "w", encoding="utf-8") as f:
             v = out["verify"]
