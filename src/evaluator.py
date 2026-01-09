@@ -129,6 +129,62 @@ def update_policy_from_outcomes(policy: Dict[str, Any], metrics: Dict[str, Any])
         policy["lambda_smooth"] = min(3.0, float(policy.get("lambda_smooth", 1.0)) + 0.2)
 
     return policy
+# ========== 시나리오 로드 ==========
+def load_mc_scenarios(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    required = {"scenario_id", "day_idx", "Product_Number", "demand"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"MC scenarios missing cols: {missing}")
+    df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
+    df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
+    return df
+
+def simulate_fixed_plan(plan_df: pd.DataFrame, demand_df: pd.DataFrame, initial_inventory: float = 0.0) -> pd.DataFrame:
+    # plan: day_idx, Product_Number, produce
+    prod = (plan_df.groupby(["Product_Number","day_idx"], as_index=False)["produce"].sum())
+    dem  = demand_df.rename(columns={"demand":"demand_s"})
+
+    sim = prod.merge(dem, on=["Product_Number","day_idx"], how="left")
+    sim["demand_s"] = sim["demand_s"].fillna(0.0)
+
+    # 정렬
+    sim = sim.sort_values(["Product_Number","day_idx"]).reset_index(drop=True)
+
+    out_rows = []
+    for p, g in sim.groupby("Product_Number"):
+        stock = float(initial_inventory)   # stock = inv - backlog
+        for _, r in g.iterrows():
+            stock = stock + float(r["produce"]) - float(r["demand_s"])
+            inv = max(stock, 0.0)
+            backlog = max(-stock, 0.0)
+            out_rows.append({
+                "Product_Number": p,
+                "day_idx": int(r["day_idx"]),
+                "produce": float(r["produce"]),
+                "demand": float(r["demand_s"]),
+                "end_inventory": inv,
+                "backlog": backlog,
+            })
+    return pd.DataFrame(out_rows)
+
+def summarize_mc_results(per_scenario_metrics: pd.DataFrame, alpha: float = 0.9) -> dict:
+    # per_scenario_metrics: scenario_id, BacklogRate, TotalBacklog, ...
+    def q(s): return float(np.quantile(s, alpha)) if len(s) else 0.0
+
+    out = {}
+    for col in ["BacklogRate", "TotalBacklog"]:
+        if col in per_scenario_metrics:
+            s = per_scenario_metrics[col].astype(float).values
+            out[col] = {
+                "mean": float(np.mean(s)),
+                "p90": q(s),
+                "max": float(np.max(s)) if len(s) else 0.0,
+            }
+    # 기 실패율(BacklogRate > 0 기준)
+    if "BacklogRate" in per_scenario_metrics:
+        out["FailRate"] = float((per_scenario_metrics["BacklogRate"] > 0.0).mean())
+    return out
 
 # ========== 통합 오케스트레이션 ==========
 def audit_and_learn(
@@ -177,6 +233,9 @@ if __name__ == "__main__":
     ap.add_argument("--policy_path", type=str, default=None, help="정책 저장/로드 파일 경로(옵션)")
     ap.add_argument("--llm_enabled", action="store_true", help="LLM 기반 critique/crosscheck 사용")
     ap.add_argument("--out_json", type=str, default=None, help="감사 결과 저장 경로(기본: plan_csv 옆 audit.json)")
+    ap.add_argument("--mc_scenarios_csv", type=str, default=None, help="MC 시나리오 수요 CSV (scenario_id, day_idx, Product_Number, demand)")
+    ap.add_argument("--initial_inventory", type=float, default=0.0, help="MC 시뮬레이션 초기 재고")
+    ap.add_argument("--mc_out_json", type=str, default=None, help="MC 검증 결과 JSON 저장 경로")
     args = ap.parse_args()
 
     # 입력 불러오기
@@ -185,6 +244,25 @@ if __name__ == "__main__":
     for c in ["demand", "produce", "backlog", "end_inventory"]:
         if c in plan_df.columns:
             plan_df[c] = pd.to_numeric(plan_df[c], errors="coerce").fillna(0.0)
+    mc_validation = None
+    if args.mc_scenarios_csv:
+        scenarios_df = load_mc_scenarios(args.mc_scenarios_csv)
+        mc_validation = mc_validate_plan(
+            plan_df=plan_df,
+            scenarios_df=scenarios_df,
+            initial_inventory=args.initial_inventory,
+            alpha=0.9,
+        )
+
+        mc_out_path = args.mc_out_json
+        if not mc_out_path:
+            base_dir = os.path.dirname(args.out_json) if args.out_json else os.path.dirname(args.plan_csv)
+            mc_out_path = os.path.join(base_dir, "mc_validation.json")
+
+        with open(mc_out_path, "w", encoding="utf-8") as f:
+            json.dump(mc_validation, f, ensure_ascii=False, indent=2)
+
+        print(f"[OK] Saved MC validation → {mc_out_path}")
 
     metrics_summary = None
     if args.metrics_json and os.path.exists(args.metrics_json):
@@ -200,6 +278,9 @@ if __name__ == "__main__":
         llm_enabled=args.llm_enabled,
     )
 
+    if mc_validation is not None:
+        result["mc_validation"] = mc_validation.get("summary", mc_validation)
+        
     # 출력 저장
     out_path = args.out_json or os.path.join(os.path.dirname(args.plan_csv), "governance_audit.json")
     with open(out_path, "w", encoding="utf-8") as f:

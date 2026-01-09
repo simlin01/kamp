@@ -256,14 +256,14 @@ def optimize_plan(
             backlog_val = solver.Value(backlog[i][d_in]) / scale
 
             rows.append({
-                "day_idx": d_out,            # 0..4
-                "horizon": hcol,             # 'T일 예상 수주량' ~ 'T+4일 예상 수주량'
-                prod_col: p,
-                "demand":        demand_val,   
-                "produce":       produce_val,  
-                "end_inventory": inv_val,      
-                "backlog":       backlog_val,  
-            })
+            "day_idx": d_out,
+            "horizon": hcol,
+            "Product_Number": p,   
+            "demand": demand_val,
+            "produce": produce_val,
+            "end_inventory": inv_val,
+            "backlog": backlog_val,
+        })
 
     return pd.DataFrame(rows)
 

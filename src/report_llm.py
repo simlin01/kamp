@@ -736,6 +736,21 @@ def _render_canonical_md(facts: dict) -> str:
     if total_capa:
         md.append(f"  - 총 CAPA(합계): { _fmt(total_capa, 1) }")
     md.append("")
+    mc = facts.get("mc_validation") or None
+    if isinstance(mc, dict) and mc:
+        # summary만 들어오는 경우/전체 dict 들어오는 경우 둘 다 대비
+        s = mc.get("summary", mc)
+
+        md.append("## Monte Carlo 검증 요약")
+        if isinstance(s.get("BacklogRate"), dict):
+            md.append(
+                f"- BacklogRate(mean/p90/max): "
+                f"{s['BacklogRate'].get('mean', 0.0):.4f} / "
+                f"{s['BacklogRate'].get('p90', 0.0):.4f} / "
+                f"{s['BacklogRate'].get('max', 0.0):.4f}"
+            )
+        md.append(f"- FailRate: {float(s.get('FailRate', 0.0)):.4f}")
+        md.append("")
     md.append("### 행동 계획 (정량 기반)")
     for act in facts.get("rule_based_actions", []):
         md.append(f"- {act}")
@@ -944,6 +959,7 @@ def build_report_with_llm(
     plan_csv: str = "",
     forecast_csv: str = "",
     metrics_csv: str = "",
+    mc_json: str = "",
     # 복수 시나리오 입력
     plan_csvs: Optional[List[str]] = None,
     scenario_names: Optional[List[str]] = None,
@@ -987,6 +1003,13 @@ def build_report_with_llm(
         "cluster_summary": cluster_summary,
     }
     facts["rule_based_actions"] = generate_rule_based_actions(facts)
+    mc_summary = None
+    if mc_json and os.path.exists(mc_json):
+        with open(mc_json, "r", encoding="utf-8") as f:
+            mc_summary = json.load(f)
+
+    facts["mc_validation"] = mc_summary
+                        
     print("[DEBUG] actions:", facts.get("rule_based_actions"))
 
     samples = []
@@ -1070,6 +1093,7 @@ def main():
     p.add_argument("--out_verify", default="weekly_report.verify.txt")
     p.add_argument("--no_regen", action="store_true", help="검증 실패 시 재생성 비활성화")
     p.add_argument("--feat", default="./data/feat.csv", help="features.py가 만든 feat.csv 경로")
+    p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로")
     args = p.parse_args()
 
     plans = []
@@ -1087,7 +1111,8 @@ def main():
         metrics_csv=args.metrics or "",
         model_name=args.model,
         feat_csv=args.feat or "",
-        auto_regen_on_fail=not args.no_regen
+        auto_regen_on_fail=not args.no_regen,
+        mc_json=args.mc_json,
     )
     md = out.get("markdown") or ""
     ps = out.get("json")  
