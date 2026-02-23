@@ -32,3 +32,6 @@ logs/
 
 # === Env Secrets ===
 .env
+
+# experiment outputs
+outputs_experiment_S30/
