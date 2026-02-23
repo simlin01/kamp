@@ -1,9 +1,37 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+"""
+planner_opt.py — CP-SAT 생산계획 (CVaR objective)
+
+[UPDATED - 핵심(정합성/안정성)]
+1) UB 타이트닝 유지
+2) ✅ CVaR 손실을 evaluator와 "완전히 동일한 정의"로 맞춤 (rate 기반)
+   - shortage = backlog 증가분(= 신규 미충족)
+   - TotalShortage_s = sum(shortage)
+   - ShortageRate_s  = TotalShortage_s / TotalDemand_s
+   - InventoryRate_s = (AvgInventory_s / daily_capacity)
+                     = (sum_inv_s/(P*D)) / day_cap
+   - Loss_s = wb * ShortageRate_s + wi * InventoryRate_s
+   - CP-SAT에서는 rate를 loss_scale 기준 정수로 만들기 위해 AddDivisionEquality 사용
+3) ✅ CVaR는 loss_int_s(=Loss_s * loss_scale)의 tail 평균으로 선형화
+4) ✅ objective 단위 통일:
+   - mean_loss_int (0..loss_scale)
+   - cvar_avg_int  (0..~2*loss_scale)
+   => lambda_scale을 너무 크게 잡아 overflow 나는 문제를 구조적으로 완화
+5) ✅ smooth 페널티 스케일: BASIC/CVaR 모두 lambda_smooth*100 통일
+6) ✅ inv/backlog reified 제거:
+   - stock(음수 가능) 한 개로 상태방정식 구성
+   - inv = max(stock,0), backlog = max(-stock,0)
+7) ✅ (중요) Warm-start AddHint 지원:
+   - --hint_plan_csv 로 이전 feasible plan(예: minlotfix_only)을 힌트로 주면
+     wb/λ 강화 시 UNKNOWN(해 탐색 실패) 확률을 크게 줄임
+"""
+
 from __future__ import annotations
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple, Any
 import json
+import os
 import re
 import unicodedata
 import argparse
@@ -11,18 +39,16 @@ import numpy as np
 import pandas as pd
 from ortools.sat.python import cp_model
 
-# -----------------------------
-# (A) 유틸 & 전처리
-# -----------------------------
-
-import re
+# =========================================================
+# (A) Utils & Preprocess
+# =========================================================
 
 def _sort_horizons_kor(hs: List[str]) -> List[str]:
     def key(h: str) -> int:
         s = str(h)
-        if s.startswith("T일"):  # 'T일 예상 수주량'
+        if s.startswith("T일"):
             return 0
-        m = re.search(r"T\+(\d+)", s)  # 'T+3일 예상 수주량' 등
+        m = re.search(r"T\+(\d+)", s)
         return int(m.group(1)) if m else 10_000
     return sorted(hs, key=key)
 
@@ -42,10 +68,10 @@ def preprocess_forecast(df: pd.DataFrame) -> pd.DataFrame:
     if "Product_Number" not in df.columns:
         raise KeyError(f"'Product_Number' 컬럼이 없습니다. 현재 컬럼: {list(df.columns)}")
 
+    # DateTime 없으면 그대로(이미 product-level이면 OK)
     if "DateTime" not in df.columns:
         return df
 
-    # DateTime 파싱 및 최신 날짜 선택
     df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
     valid = df.dropna(subset=["DateTime"])
     if valid.empty:
@@ -53,7 +79,7 @@ def preprocess_forecast(df: pd.DataFrame) -> pd.DataFrame:
 
     latest_dt = (
         valid.groupby("Product_Number", as_index=False)["DateTime"].max()
-              .rename(columns={"DateTime": "_LatestDT"})
+             .rename(columns={"DateTime": "_LatestDT"})
     )
     merged = df.merge(latest_dt, on="Product_Number", how="inner")
     picked = merged[merged["DateTime"] == merged["_LatestDT"]].copy()
@@ -66,12 +92,112 @@ def preprocess_forecast(df: pd.DataFrame) -> pd.DataFrame:
 
 def load_cluster_info(feat_file: str) -> Dict[str, int]:
     df = pd.read_csv(feat_file)
-    cols = [_normalize_col(c) for c in df.columns]
-    df.columns = cols
+    df.columns = [_normalize_col(c) for c in df.columns]
     if "Product_Number" not in df.columns or "Cluster" not in df.columns:
         raise ValueError("feat.csv에는 'Product_Number', 'Cluster' 컬럼이 필요합니다.")
     m = df[["Product_Number", "Cluster"]].drop_duplicates()
     return m.set_index("Product_Number")["Cluster"].to_dict()
+
+# =========================================================
+# (A-1) Warm-start Hint loader
+# =========================================================
+
+def load_hint_plan_csv(path: str, scale: int = 10) -> Dict[Tuple[str, int], int]:
+    """
+    hint plan CSV -> {(Product_Number, day_idx): produce_int_scaled}
+    """
+    df = pd.read_csv(path)
+    need = {"Product_Number", "day_idx", "produce"}
+    if not need.issubset(df.columns):
+        raise ValueError(f"hint_plan_csv에는 {sorted(need)} 컬럼이 필요합니다. 현재={list(df.columns)}")
+
+    df["Product_Number"] = df["Product_Number"].astype(str).str.replace(r"\.0$", "", regex=True)
+    df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
+    df["produce"] = pd.to_numeric(df["produce"], errors="coerce").fillna(0.0)
+
+    m: Dict[Tuple[str, int], int] = {}
+    for r in df.itertuples(index=False):
+        p = str(r.Product_Number)
+        d = int(r.day_idx)
+        v = int(round(float(r.produce) * scale))
+        if v < 0:
+            v = 0
+        m[(p, d)] = v
+    return m
+
+# =========================================================
+# (A-2) MC loader (raw scenarios)
+# =========================================================
+
+def load_mc_scenarios(
+    mc_npz: Optional[str],
+    mc_csv: Optional[str],
+    product_col: str = "Product_Number",
+) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
+    """CVaR용 raw scenarios 반환 (S,P,D), products list"""
+    if mc_npz and os.path.exists(mc_npz):
+        z = np.load(mc_npz, allow_pickle=True)
+
+        scenarios = None
+        for key in ["scenarios", "scenario", "X", "arr_0"]:
+            if key in z:
+                scenarios = z[key]
+                break
+
+        products = None
+        for key in ["products", "product_list", "prod", "arr_1"]:
+            if key in z:
+                products = z[key]
+                break
+
+        if scenarios is None or products is None:
+            raise KeyError(f"mc_npz missing scenarios/products. keys={list(z.keys())}")
+
+        scenarios = np.asarray(scenarios, dtype=float)
+        products = pd.Series(products).astype(str).str.replace(r"\.0$", "", regex=True).tolist()
+        return scenarios, products
+
+    if mc_csv and os.path.exists(mc_csv):
+        df = pd.read_csv(mc_csv)
+
+        need = {"scenario_id", "day_idx", product_col, "demand"}
+        if not need.issubset(df.columns):
+            raise ValueError(f"mc_csv에는 {sorted(need)} 컬럼이 필요합니다. 현재={list(df.columns)}")
+
+        df["scenario_id"] = pd.to_numeric(df["scenario_id"], errors="coerce").fillna(0).astype(int)
+        df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
+        df[product_col] = df[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+        df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
+
+        S = int(df["scenario_id"].max()) + 1
+        D = int(df["day_idx"].max()) + 1
+        products = sorted(df[product_col].unique().tolist())
+        P = len(products)
+        pid = {p: i for i, p in enumerate(products)}
+
+        scenarios = np.zeros((S, P, D), dtype=float)
+        for r in df.itertuples(index=False):
+            s = int(r.scenario_id)
+            d = int(r.day_idx)
+            p = str(getattr(r, product_col))
+            scenarios[s, pid[p], d] = float(r.demand)
+
+        return scenarios, products
+
+    return None, None
+
+def reorder_mc_scenarios_to_forecast(
+    scenarios: np.ndarray,
+    mc_products: List[str],
+    forecast_products: List[str],
+) -> np.ndarray:
+    mc_index = {p: i for i, p in enumerate(mc_products)}
+    S, _, D = scenarios.shape
+    out = np.zeros((S, len(forecast_products), D), dtype=float)
+    for j, p in enumerate(forecast_products):
+        if p in mc_index:
+            out[:, j, :] = scenarios[:, mc_index[p], :]
+    return out
 
 def detect_horizons(df: pd.DataFrame) -> List[str]:
     candidates = []
@@ -84,244 +210,619 @@ def detect_horizons(df: pd.DataFrame) -> List[str]:
 
     def _key(x: str) -> int:
         s = _normalize_col(x)
-        if s == "T": return 0
+        if s == "T":
+            return 0
         m = re.match(r"T\+(\d+)", s)
-        if m: return int(m.group(1))       
+        if m:
+            return int(m.group(1))
         m2 = re.search(r"T\+(\d+)", s)
         return int(m2.group(1)) if m2 else 10_000
+
     candidates = sorted(set(candidates), key=_key)
     if not candidates:
         raise ValueError("horizons 자동 감지 실패. --horizons 로 명시해 주세요.")
     return candidates
 
-# -----------------------------
-# (B) CP-SAT 변수 헬퍼
-# -----------------------------
+# =========================================================
+# (B) CP-SAT var helpers
+# =========================================================
+
 def _make_2d_int(model: cp_model.CpModel, P: int, D: int, lb: int, ub: int, name: str):
     return [[model.NewIntVar(lb, ub, f"{name}_{i}_{d}") for d in range(D)] for i in range(P)]
+
+def _make_3d_int(model: cp_model.CpModel, S: int, P: int, D: int, lb: int, ub: int, name: str):
+    return [[[model.NewIntVar(lb, ub, f"{name}_{s}_{i}_{d}") for d in range(D)] for i in range(P)] for s in range(S)]
 
 def _make_2d_bool(model: cp_model.CpModel, P: int, D: int, name: str):
     return [[model.NewBoolVar(f"{name}_{i}_{d}") for d in range(D)] for i in range(P)]
 
-# -----------------------------
-# (C) 최적화
-# -----------------------------
+# =========================================================
+# (C) Optimization
+# =========================================================
+
+_INT64_MAX = 9_000_000_000_000_000_000  # 9e18 safety
+
+def _make_solver(
+    solver_seed: int,
+    max_time: float,
+    workers: int,
+    gap: float,
+    log_progress: bool,
+) -> cp_model.CpSolver:
+    solver = cp_model.CpSolver()
+    solver.parameters.relative_gap_limit = float(gap)
+    solver.parameters.max_time_in_seconds = float(max_time)
+    solver.parameters.num_search_workers = int(workers)
+    solver.parameters.log_search_progress = bool(log_progress)
+    solver.parameters.random_seed = int(solver_seed)
+    return solver
+
+def _safe_int_cap(x: int, cap: int = 5_000_000_000) -> int:
+    return int(min(max(int(x), 1), int(cap)))
+
 def optimize_plan(
     forecast_by_product: pd.DataFrame,
     horizons: List[str],
     prod_col: str,
     cluster_info: Dict[str, int],
-    daily_capacity: int = 10000,
-    lambda_smooth: float = 1.0,
+    daily_capacity: int = 15000,
+    lambda_smooth: float = 0.5,
     initial_inventory: float = 0.0,
-    int_production: bool = True,   # CP-SAT은 정수, 인터페이스 일치 목적
+    int_production: bool = True,  # CLI 호환 유지
     scale: int = 10,
     initial_inventory_map: Optional[Dict[str, float]] = None,
     min_lot_map: Optional[Dict[int, float]] = None,
     safety_stock_map: Optional[Dict[int, float]] = None,
     weight_map: Optional[Dict[int, float]] = None,
-) -> pd.DataFrame:
-    
-    def _diag_horizons(df: pd.DataFrame, horizons: list, prod_col: str, tag: str="[DIAG]"):
-        # 1) 컬럼 정규화 확인
-        print(f"{tag} columns(sample 10):", list(df.columns)[:10])
 
-        # 2) 누락/추가 horizon 확인
-        miss = [h for h in horizons if h not in df.columns]
-        extra = [c for c in df.columns if c not in ([prod_col] + horizons)]
-        print(f"{tag} missing_horizons:", miss)
-        if miss:
-            import difflib
-            for h in miss:
-                near = difflib.get_close_matches(h, [str(c) for c in df.columns], n=3, cutoff=0.6)
-                print(f"{tag}  -> near matches for '{h}': {near}")
+    # ---- Warm start ----
+    hint_plan: Optional[Dict[Tuple[str, int], int]] = None,
 
-        # 3) 데이터 타입/NaN 비율
-        sub = df[[prod_col] + [h for h in horizons if h in df.columns]].copy()
-        num = sub.select_dtypes(include="number").columns.tolist()
-        print(f"{tag} numeric_cols in horizons:", [c for c in horizons if c in num])
-        print(f"{tag} NaN ratio per horizon:", sub[horizons].isna().mean().round(4).to_dict())
-        print(f"{tag} head:")
-        print(sub.head(3))
-    
-    """클러스터 정책을 인자로 주입 가능한 CP-SAT 생산계획 최적화."""
+    # ---- CVaR objective ----
+    use_cvar_obj: bool = False,
+    mc_scenarios: Optional[np.ndarray] = None,     # (S,P,D) in forecast product order
+    cvar_alpha: float = 0.9,
+    lambda_cvar: float = 0.3,
+    lambda_scale: int = 100_000_000,
+    mc_wb: float = 1.0,
+    mc_wi: float = 0.2,
+    loss_scale: int = 100_000,
+
+    # ---- solver controls ----
+    solver_seed: int = 42,
+    max_time: float = 300.0,
+    workers: int = 1,
+    gap: float = 0.1,
+    log_progress: bool = True,
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+
     min_lot_map = min_lot_map or {0: 100, 1: 50, 2: 0, 3: 200}
     safety_stock_map = safety_stock_map or {0: 0, 1: 0, 2: 0, 3: 0}
     weight_map = weight_map or {0: 5.0, 1: 2.0, 2: 0.5, 3: 1.0}
 
     df = preprocess_forecast(forecast_by_product)
     df[prod_col] = df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
-    model = cp_model.CpModel()
 
-    # ----- 데이터 준비 -----
     products = df[prod_col].tolist()
     P, D = len(products), len(horizons)
 
     demand_f = df[horizons].to_numpy(dtype=float)
-    demand_i = np.rint(demand_f * scale).astype(int)
-    init_inv_i = int(round(initial_inventory * scale))
+    demand_i = np.rint(np.maximum(demand_f, 0.0) * scale).astype(int)  # (P,D)
 
-    BIG = int((daily_capacity * scale) * D * 2)
-    day_cap = daily_capacity * scale
+    day_cap = int(daily_capacity * scale)
 
-    # ----- 변수 -----
-    produce = _make_2d_int(model, P, D, 0, BIG, "produce")   # 생산량
-    inv     = _make_2d_int(model, P, D, 0, BIG, "inv")       # 종료 재고
-    backlog = _make_2d_int(model, P, D, 0, BIG, "backlog")   # 종료 백로그
-    is_prod = _make_2d_bool(model, P, D, "is_prod")          # 생산 여부
+    # UB 타이트닝
+    PROD_UB = day_cap
+    DIFF_UB = day_cap
 
-    # ----- 제약 -----
+    model = cp_model.CpModel()
+    produce = _make_2d_int(model, P, D, 0, PROD_UB, "produce")
+    is_prod = _make_2d_bool(model, P, D, "is_prod")
+
+    # ---- Warm-start (AddHint) ----
+    if hint_plan:
+        for i, p in enumerate(products):
+            for d in range(D):
+                key = (p, d)
+                if key in hint_plan:
+                    v = int(hint_plan[key])
+                    if v < 0:
+                        v = 0
+                    if v > PROD_UB:
+                        v = PROD_UB
+                    model.AddHint(produce[i][d], v)
+                    model.AddHint(is_prod[i][d], 1 if v > 0 else 0)
+
+    # lot/production + CAPA
     for i, p in enumerate(products):
-        cid = int(cluster_info.get(p, 1))  # 키 없을 때 기본 클러스터 1
+        cid = int(cluster_info.get(p, 1))
         min_lot = int(min_lot_map.get(cid, 0) * scale)
-        s_stock = int(safety_stock_map.get(cid, 0) * scale)
-
         for d in range(D):
-            if d == 0:
-                init_inv_i = int(round(initial_inventory_map.get(p, initial_inventory) * scale)) \
-                             if initial_inventory_map else int(round(initial_inventory * scale))
-                prev_inv = init_inv_i
-            else:
-                prev_inv = inv[i][d-1]
-            # 재고 흐름 (완화형): prev_inv + produce - demand == inv - backlog
-            model.Add(prev_inv + produce[i][d] - demand_i[i, d] == inv[i][d] - backlog[i][d])
-            # 재고/백로그 동시양수 방지 (논리)
-            inv_pos  = model.NewBoolVar(f"inv_pos_{i}_{d}")
-            back_pos = model.NewBoolVar(f"back_pos_{i}_{d}")
-            model.Add(inv[i][d] >= 1).OnlyEnforceIf(inv_pos)
-            model.Add(inv[i][d] <= 0).OnlyEnforceIf(inv_pos.Not())
-            model.Add(backlog[i][d] >= 1).OnlyEnforceIf(back_pos)
-            model.Add(backlog[i][d] <= 0).OnlyEnforceIf(back_pos.Not())
-            model.AddBoolOr([inv_pos.Not(), back_pos.Not()])
-
-            # 안전재고 (d>0일 때만 강제)
-            if s_stock > 0 and d > 0:
-                model.Add(inv[i][d] >= s_stock).OnlyEnforceIf(back_pos.Not())
-
-            # 최소 로트 / 생산여부
             if min_lot > 0:
                 model.Add(produce[i][d] >= min_lot).OnlyEnforceIf(is_prod[i][d])
-                model.Add(produce[i][d] <= demand_i[i, d] + day_cap).OnlyEnforceIf(is_prod[i][d])
+                model.Add(produce[i][d] <= day_cap).OnlyEnforceIf(is_prod[i][d])
                 model.Add(produce[i][d] == 0).OnlyEnforceIf(is_prod[i][d].Not())
             else:
                 model.Add(produce[i][d] <= day_cap * is_prod[i][d])
 
-    # 일일 CAPA
     for d in range(D):
         model.Add(sum(produce[i][d] for i in range(P)) <= day_cap)
 
-    # ----- 목적함수 -----
-    terms = []
-    # (1) 백로그 최소화 (클러스터 가중치 반영)
-    for i, p in enumerate(products):
-        cid = int(cluster_info.get(p, 1))
-        w = int(round(weight_map.get(cid, 1.0) * 100))
-        for d in range(D):
-            terms.append(w * backlog[i][d])
+    # =====================================================
+    # BASIC MODE
+    # =====================================================
+    if not use_cvar_obj:
+        cum_dem = np.cumsum(demand_i, axis=1)  # (P,D)
+        STATE_UB = _safe_int_cap(int(cum_dem.max() * 2))
 
-    # (2) 생산변동 완화 |produce_d - produce_{d-1}|
-    lam = int(round(lambda_smooth * 1))
-    if lam > 0:
+        # stock 기반(음수 허용)
+        stock   = _make_2d_int(model, P, D, -STATE_UB, STATE_UB, "stock")
+        inv     = _make_2d_int(model, P, D, 0, STATE_UB, "inv")
+        backlog = _make_2d_int(model, P, D, 0, STATE_UB, "backlog")
+        ZERO = model.NewIntVar(0, 0, "ZERO_BASIC")
+
+        for i, p in enumerate(products):
+            cid = int(cluster_info.get(p, 1))
+            s_stock = int(safety_stock_map.get(cid, 0) * scale)
+
+            for d in range(D):
+                if d == 0:
+                    init_inv_i = int(round((initial_inventory_map.get(p, initial_inventory) if initial_inventory_map else initial_inventory) * scale))
+                    prev_stock = init_inv_i
+                else:
+                    prev_stock = stock[i][d-1]
+
+                model.Add(stock[i][d] == prev_stock + produce[i][d] - demand_i[i, d])
+                model.AddMaxEquality(inv[i][d], [stock[i][d], ZERO])
+
+                neg_stock = model.NewIntVar(-STATE_UB, STATE_UB, f"neg_stock_{i}_{d}")
+                model.Add(neg_stock == -stock[i][d])
+                model.AddMaxEquality(backlog[i][d], [neg_stock, ZERO])
+
+                if s_stock > 0:
+                    model.Add(inv[i][d] >= s_stock)
+
+        terms = []
+        for i, p in enumerate(products):
+            cid = int(cluster_info.get(p, 1))
+            w = int(round(weight_map.get(cid, 1.0) * 100))
+            for d in range(D):
+                terms.append(w * backlog[i][d])
+
+        smooth_w = int(round(lambda_smooth * 100))  # 통일: *100
+        if smooth_w > 0:
+            for i in range(P):
+                for d in range(1, D):
+                    diff = model.NewIntVar(0, DIFF_UB, f"diff_{i}_{d}")
+                    model.Add(diff >= produce[i][d] - produce[i][d-1])
+                    model.Add(diff >= produce[i][d-1] - produce[i][d])
+                    terms.append(smooth_w * diff)
+
+        model.Minimize(sum(terms))
+
+        solver = _make_solver(solver_seed, max_time, workers, gap, log_progress)
+        status = solver.Solve(model)
+        if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            raise RuntimeError(f"OR-Tools: {solver.StatusName(status)} (실행 가능한 계획 실패)")
+
+        rows = []
+        for d_in, hcol in enumerate(horizons):
+            for i, p in enumerate(products):
+                rows.append({
+                    "day_idx": int(d_in),
+                    "horizon": hcol,
+                    "Product_Number": p,
+                    "demand": float(demand_i[i, d_in] / scale),
+                    "produce": float(solver.Value(produce[i][d_in]) / scale),
+                    "end_inventory": float(solver.Value(inv[i][d_in]) / scale),
+                    "backlog": float(solver.Value(backlog[i][d_in]) / scale),
+                })
+        plan_df = pd.DataFrame(rows)
+        diag = {
+            "mode": "basic",
+            "status": solver.StatusName(status),
+            "objective": float(solver.ObjectiveValue()),
+            "STATE_UB": int(STATE_UB),
+            "PROD_UB": int(PROD_UB),
+            "smooth_w": int(smooth_w),
+        }
+        return plan_df, diag
+
+    # =====================================================
+    # CVaR MODE (ShortageRate 기반, evaluator와 정합)
+    # =====================================================
+    if mc_scenarios is None:
+        raise ValueError("use_cvar_obj=True 인데 mc_scenarios가 없습니다. (S,P,D) 시나리오 텐서를 넘겨주세요.")
+
+    mc_scenarios = np.asarray(mc_scenarios, dtype=float)
+    if mc_scenarios.ndim != 3:
+        raise ValueError(f"mc_scenarios는 (S,P,D) 이어야 합니다. got shape={mc_scenarios.shape}")
+
+    S, P2, D2 = mc_scenarios.shape
+    if P2 != P:
+        raise ValueError(f"mc_scenarios P축({P2}) != forecast P({P}). 제품 reorder가 필요합니다.")
+    if D2 < D:
+        raise ValueError(f"mc_scenarios D({D2}) < horizons D({D}).")
+    if D2 > D:
+        mc_scenarios = mc_scenarios[:, :, :D]
+
+    mc_demand_i = np.rint(np.maximum(mc_scenarios, 0.0) * scale).astype(int)  # (S,P,D)
+
+    # UB: 시나리오 누적수요 최댓값 기반(타이트)
+    cum_dem_max = np.cumsum(mc_demand_i, axis=2).max(axis=0)  # (P,D)
+    STATE_UB = _safe_int_cap(int(cum_dem_max.max() * 2))
+
+    stock_s   = _make_3d_int(model, S, P, D, -STATE_UB, STATE_UB, "stock_s")
+    inv_s     = _make_3d_int(model, S, P, D, 0, STATE_UB, "inv_s")
+    backlog_s = _make_3d_int(model, S, P, D, 0, STATE_UB, "backlog_s")
+    ZERO = model.NewIntVar(0, 0, "ZERO_CVAR")
+
+    for s in range(S):
+        for i, p in enumerate(products):
+            cid = int(cluster_info.get(p, 1))
+            s_stock = int(safety_stock_map.get(cid, 0) * scale)
+
+            for d in range(D):
+                if d == 0:
+                    init_inv_i = int(round((initial_inventory_map.get(p, initial_inventory) if initial_inventory_map else initial_inventory) * scale))
+                    prev_stock = init_inv_i
+                else:
+                    prev_stock = stock_s[s][i][d-1]
+
+                model.Add(stock_s[s][i][d] == prev_stock + produce[i][d] - mc_demand_i[s, i, d])
+                model.AddMaxEquality(inv_s[s][i][d], [stock_s[s][i][d], ZERO])
+
+                neg_stock = model.NewIntVar(-STATE_UB, STATE_UB, f"neg_stock_s{s}_{i}_{d}")
+                model.Add(neg_stock == -stock_s[s][i][d])
+                model.AddMaxEquality(backlog_s[s][i][d], [neg_stock, ZERO])
+
+                if s_stock > 0:
+                    model.Add(inv_s[s][i][d] >= s_stock)
+
+    # ---- Shortage 정의: backlog 증가분(신규 미충족) ----
+    SHORT_UB = STATE_UB
+    shortage_s = _make_3d_int(model, S, P, D, 0, SHORT_UB, "short_s")
+
+    for s in range(S):
+        for i in range(P):
+            model.Add(shortage_s[s][i][0] == backlog_s[s][i][0])
+            for d in range(1, D):
+                inc = model.NewIntVar(-STATE_UB, STATE_UB, f"back_inc_s{s}_{i}_{d}")
+                model.Add(inc == backlog_s[s][i][d] - backlog_s[s][i][d-1])
+                model.AddMaxEquality(shortage_s[s][i][d], [inc, ZERO])
+
+    # ---- Scenario aggregates ----
+    sum_bd = int(STATE_UB * P * D)
+    sum_bd = _safe_int_cap(sum_bd, cap=3_000_000_000)
+
+    total_short_s = [model.NewIntVar(0, sum_bd, f"total_short_s{s}") for s in range(S)]
+    sum_inv_s     = [model.NewIntVar(0, sum_bd, f"sum_inv_s{s}")     for s in range(S)]
+
+    for s in range(S):
+        model.Add(total_short_s[s] == sum(shortage_s[s][i][d] for i in range(P) for d in range(D)))
+        model.Add(sum_inv_s[s]     == sum(inv_s[s][i][d]      for i in range(P) for d in range(D)))
+
+    # =====================================================
+    # Rate-based loss (evaluator와 1:1 일치)
+    #   short_rate_int[s] = TotalShortage_s * loss_scale / TotalDemand_s
+    #   inv_rate_int[s]   = SumInv_s * loss_scale / (P*D*day_cap)
+    #   loss_int_s        = floor((wb*short + wi*inv) * loss_scale)
+    # =====================================================
+    total_dem_i = mc_demand_i.sum(axis=(1, 2)).astype(int)  # (S,)
+    total_dem_i = np.maximum(total_dem_i, 1)
+
+    denom_inv = int(max(P * D * day_cap, 1))
+
+    short_rate_int = [model.NewIntVar(0, int(loss_scale), f"short_rate_int_s{s}") for s in range(S)]
+    inv_rate_int   = [model.NewIntVar(0, int(loss_scale), f"inv_rate_int_s{s}")   for s in range(S)]
+
+    for s in range(S):
+        model.AddDivisionEquality(short_rate_int[s], total_short_s[s] * int(loss_scale), int(total_dem_i[s]))
+        model.AddDivisionEquality(inv_rate_int[s],   sum_inv_s[s]     * int(loss_scale), int(denom_inv))
+
+    # 실수 가중치 -> 정수 가중치
+    WDEN = 1000
+    wb_w = max(0, int(round(mc_wb * WDEN)))
+    wi_w = max(0, int(round(mc_wi * WDEN)))
+
+    weighted_sum_ub = int((wb_w + wi_w) * loss_scale)
+    weighted_sum_ub = max(weighted_sum_ub, 1)
+
+    weighted_sum_s = [model.NewIntVar(0, weighted_sum_ub, f"w_sum_s{s}") for s in range(S)]
+    loss_int_s     = [model.NewIntVar(0, int(loss_scale), f"loss_int_s{s}") for s in range(S)]
+
+    for s in range(S):
+        model.Add(weighted_sum_s[s] == wb_w * short_rate_int[s] + wi_w * inv_rate_int[s])
+        model.AddDivisionEquality(loss_int_s[s], weighted_sum_s[s], WDEN)
+
+    # ---- CVaR linearization on loss_int_s ----
+    a = float(cvar_alpha)
+    a = min(max(a, 0.0), 0.999999)
+
+    den = int(np.ceil((1.0 - a) * S))
+    den = max(den, 1)
+
+    eta = model.NewIntVar(0, int(loss_scale), "eta_var")
+    z   = [model.NewIntVar(0, int(loss_scale), f"z_s{s}") for s in range(S)]
+    for s in range(S):
+        model.Add(z[s] >= loss_int_s[s] - eta)
+        model.Add(z[s] >= 0)
+
+    sum_z_ub = int(S * loss_scale)
+    sum_z = model.NewIntVar(0, sum_z_ub, "sum_z")
+    model.Add(sum_z == sum(z))
+
+    tail_avg = model.NewIntVar(0, int(loss_scale), "tail_avg")
+    model.AddDivisionEquality(tail_avg, sum_z, den)
+
+    cvar_avg = model.NewIntVar(0, int(2 * loss_scale), "cvar_avg")
+    model.Add(cvar_avg == eta + tail_avg)
+
+    # ---- mean loss ----
+    sum_loss = model.NewIntVar(0, int(S * loss_scale), "sum_loss")
+    model.Add(sum_loss == sum(loss_int_s))
+    mean_loss = model.NewIntVar(0, int(loss_scale), "mean_loss")
+    model.AddDivisionEquality(mean_loss, sum_loss, int(S))
+
+    # ---- smooth penalty ----
+    base_terms = []
+    smooth_w = int(round(lambda_smooth * 100))  # 통일: *100
+    if smooth_w > 0:
         for i in range(P):
             for d in range(1, D):
-                diff = model.NewIntVar(0, BIG, f"diff_{i}_{d}")
+                diff = model.NewIntVar(0, DIFF_UB, f"diff_{i}_{d}")
                 model.Add(diff >= produce[i][d] - produce[i][d-1])
                 model.Add(diff >= produce[i][d-1] - produce[i][d])
-                terms.append(lam * diff)
+                base_terms.append(smooth_w * diff)
 
-    model.Minimize(sum(terms))
+    # ---- objective ----
+    lam_int = int(round(float(lambda_cvar) * int(lambda_scale)))
+    lam_int = max(lam_int, 0)
 
-    solver = cp_model.CpSolver()
-    solver.parameters.relative_gap_limit = 0.02
-    solver.parameters.max_time_in_seconds = 300.0
-    solver.parameters.num_search_workers = 8
-    solver.parameters.log_search_progress = True
-    solver.parameters.random_seed = 42
+    if lam_int > 0 and lam_int * int(2 * loss_scale) > _INT64_MAX:
+        raise RuntimeError("objective overflow risk. Try smaller --lambda_scale or --lambda_cvar.")
 
+    model.Minimize(sum(base_terms) + mean_loss + lam_int * cvar_avg)
+
+    solver = _make_solver(solver_seed, max_time, workers, gap, log_progress)
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"OR-Tools: {solver.StatusName(status)} (실행 가능한 계획 실패)")
 
-    # ----- 결과 복원 -----
-    disp_horizons = _sort_horizons_kor(horizons)
-    idx_of = {h: i for i, h in enumerate(horizons)} 
+    demand_mean = mc_scenarios.mean(axis=0)  # (P,D)
 
     rows = []
-    for d_out, hcol in enumerate(disp_horizons):
-        d_in = idx_of[hcol]  # 내부 인덱스
+    for d_in, hcol in enumerate(horizons):
         for i, p in enumerate(products):
-            demand_val = demand_i[i, d_in] / scale
-            produce_val = solver.Value(produce[i][d_in]) / scale
-            inv_val = solver.Value(inv[i][d_in]) / scale
-            backlog_val = solver.Value(backlog[i][d_in]) / scale
-
+            inv_mean  = float(np.mean([solver.Value(inv_s[s][i][d_in]) for s in range(S)]) / scale)
+            back_mean = float(np.mean([solver.Value(backlog_s[s][i][d_in]) for s in range(S)]) / scale)
+            sh_mean   = float(np.mean([solver.Value(shortage_s[s][i][d_in]) for s in range(S)]) / scale)
             rows.append({
-            "day_idx": d_out,
-            "horizon": hcol,
-            "Product_Number": p,   
-            "demand": demand_val,
-            "produce": produce_val,
-            "end_inventory": inv_val,
-            "backlog": backlog_val,
-        })
+                "day_idx": int(d_in),
+                "horizon": hcol,
+                "Product_Number": p,
+                "demand": float(demand_mean[i, d_in]),
+                "produce": float(solver.Value(produce[i][d_in]) / scale),
+                "end_inventory": inv_mean,
+                "backlog": back_mean,
+                "shortage": sh_mean,
+            })
 
-    return pd.DataFrame(rows)
+    plan_df = pd.DataFrame(rows)
+    diag = {
+        "mode": "cvar_shortage_rate",
+        "status": solver.StatusName(status),
+        "objective": float(solver.ObjectiveValue()),
+        "eta": int(solver.Value(eta)),
+        "cvar_avg": int(solver.Value(cvar_avg)),
+        "mean_loss": int(solver.Value(mean_loss)),
+        "den": int(den),
+        "S": int(S),
+        "lambda_cvar": float(lambda_cvar),
+        "lambda_scale": int(lambda_scale),
+        "loss_scale": int(loss_scale),
+        "solver_seed": int(solver_seed),
+        "max_time": float(max_time),
+        "gap": float(gap),
+        "workers": int(workers),
+        "STATE_UB": int(STATE_UB),
+        "PROD_UB": int(PROD_UB),
+        "smooth_w": int(smooth_w),
+        "wb_w": int(wb_w),
+        "wi_w": int(wi_w),
+        "note": "rate-based loss: wb*ShortageRate + wi*InventoryRate (matches evaluator)",
+    }
+    print("[CVaR]", diag)
+    return plan_df, diag
 
-# -----------------------------
-# (D) CLI (plan_from_csv 통합)
-# -----------------------------
+# =========================================================
+# (D) CLI
+# =========================================================
+
+def _load_map_json_or_file(s: Optional[str]) -> Optional[Dict[int, float]]:
+    if not s:
+        return None
+    if s.startswith("@"):
+        with open(s[1:], "r", encoding="utf-8") as f:
+            data = json.load(f)
+    else:
+        data = json.loads(s)
+    return {int(k): float(v) for k, v in data.items()}
+
+def _run_optimize_with_fallbacks(
+    *,
+    forecast_df: pd.DataFrame,
+    horizons: List[str],
+    args: argparse.Namespace,
+    cluster_info: Dict[str, int],
+    inv_map: Dict[str, float],
+    scenarios_re: Optional[np.ndarray],
+    hint_plan: Optional[Dict[Tuple[str, int], int]],
+    lam: float,
+    loss_scale_init: int,
+) -> Tuple[pd.DataFrame, Dict[str, Any], int]:
+    attempts = []
+    attempts.append({"workers": int(args.workers), "max_time": float(args.max_time), "gap": float(args.gap), "loss_scale": int(loss_scale_init)})
+    attempts.append({"workers": 1, "max_time": float(args.max_time) * 2.0, "gap": min(0.10, float(args.gap) * 1.5), "loss_scale": int(loss_scale_init)})
+    attempts.append({"workers": 1, "max_time": float(args.max_time) * 2.0, "gap": min(0.15, float(args.gap) * 2.0), "loss_scale": max(100, int(loss_scale_init // 2))})
+
+    last_err = None
+    for k, cfg in enumerate(attempts, start=1):
+        try:
+            plan_df, diag = optimize_plan(
+                forecast_by_product=forecast_df,
+                horizons=horizons,
+                prod_col=args.product_col,
+                cluster_info=cluster_info,
+                daily_capacity=args.daily_capacity,
+                lambda_smooth=args.lambda_smooth,
+                initial_inventory=args.initial_inventory,
+                int_production=args.int_production,
+                scale=args.scale,
+                min_lot_map=_load_map_json_or_file(args.min_lot_map),
+                safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
+                weight_map=_load_map_json_or_file(args.weight_map),
+                initial_inventory_map=inv_map,
+
+                hint_plan=hint_plan,
+
+                use_cvar_obj=True,
+                mc_scenarios=scenarios_re,
+                cvar_alpha=args.cvar_alpha,
+                lambda_cvar=float(lam),
+                lambda_scale=args.lambda_scale,
+                mc_wb=args.mc_wb,
+                mc_wi=args.mc_wi,
+                loss_scale=int(cfg["loss_scale"]),
+
+                solver_seed=args.solver_seed,
+                max_time=float(cfg["max_time"]),
+                workers=int(cfg["workers"]),
+                gap=float(cfg["gap"]),
+                log_progress=args.log_progress,
+            )
+            diag["fallback_attempt"] = k
+            diag["workers_used"] = int(cfg["workers"])
+            diag["max_time_used"] = float(cfg["max_time"])
+            diag["gap_used"] = float(cfg["gap"])
+            diag["loss_scale_used"] = int(cfg["loss_scale"])
+            return plan_df, diag, int(cfg["loss_scale"])
+        except Exception as e:
+            last_err = str(e)
+            print(f"[FALLBACK-FAIL] attempt={k} workers={cfg['workers']} time={cfg['max_time']} gap={cfg['gap']} loss_scale={cfg['loss_scale']} err={last_err}")
+            continue
+
+    raise RuntimeError(last_err or "All fallback attempts failed.")
+
 def main():
-    ap = argparse.ArgumentParser(description="CP-SAT 생산계획 (단일 파일: 코어+CLI)")
-    ap.add_argument("--in_csv", required=True, help="예측 수요 CSV (pred.csv)")
-    ap.add_argument("--feat_csv", required=True, help="클러스터 매핑 CSV (feat.csv)")
-    ap.add_argument("--out_csv", required=True, help="출력 파일 (production_plan.csv)")
+    ap = argparse.ArgumentParser(description="CP-SAT 생산계획 (CVaR objective + fallback 포함)")
+
+    ap.add_argument("--in_csv", required=True)
+    ap.add_argument("--feat_csv", required=True)
+    ap.add_argument("--out_csv", required=True)
+
     ap.add_argument("--product_col", default="Product_Number")
-    ap.add_argument("--horizons", nargs="*", default=None, help='예: T "T+1" "T+2" ... (미지정 시 자동 감지)')
-    ap.add_argument("--daily_capacity", type=int, default=10000)
-    ap.add_argument("--lambda_smooth", type=float, default=1.0)
+    ap.add_argument("--horizons", nargs="*", default=None)
+
+    ap.add_argument("--daily_capacity", type=int, default=15000)
+    ap.add_argument("--lambda_smooth", type=float, default=0.5)
     ap.add_argument("--initial_inventory", type=float, default=0.0)
+
     ap.add_argument("--scale", type=int, default=10)
+
     ap.add_argument("--int_production", action="store_true")
-    ap.add_argument("--min_lot_map", type=str, default=None, help='JSON 또는 @file.json')
+    ap.add_argument("--min_lot_map", type=str, default=None)
     ap.add_argument("--safety_stock_map", type=str, default=None)
     ap.add_argument("--weight_map", type=str, default=None)
     ap.add_argument("--initial_inventory_map", type=str, default=None)
+
+    # Warm-start
+    ap.add_argument("--hint_plan_csv", type=str, default=None, help="Warm-start hint plan CSV (Product_Number, day_idx, produce)")
+
+    ap.add_argument("--solver_seed", type=int, default=42)
+    ap.add_argument("--max_time", type=float, default=300.0)
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--gap", type=float, default=0.1)
+    ap.add_argument("--log_progress", action="store_true")
+
+    ap.add_argument("--use_cvar_obj", action="store_true")
+    ap.add_argument("--mc_npz", default=None)
+    ap.add_argument("--mc_csv", default=None)
+
+    ap.add_argument("--cvar_alpha", type=float, default=0.9)
+    ap.add_argument("--lambda_cvar", type=float, default=0.3)
+    ap.add_argument("--lambda_scale", type=int, default=100_000_000)
+    ap.add_argument("--mc_wb", type=float, default=1.0)
+    ap.add_argument("--mc_wi", type=float, default=0.2)
+    ap.add_argument("--loss_scale", type=int, default=100_000)
+
     args = ap.parse_args()
 
-    def _load_map(s: Optional[str]) -> Optional[Dict[int, float]]:
-        if not s: return None
-        if s.startswith("@"):
-            with open(s[1:], "r", encoding="utf-8") as f:
-                data = json.load(f)
-        else:
-            data = json.loads(s)
-        return {int(k): float(v) for k, v in data.items()}
-
     pred = pd.read_csv(args.in_csv)
-    feat = args.feat_csv
-    cluster_info = load_cluster_info(feat)
+    cluster_info = load_cluster_info(args.feat_csv)
 
     forecast_df = preprocess_forecast(pred)
     horizons = args.horizons or detect_horizons(forecast_df)
-    inv_map = _load_map(args.initial_inventory_map) or {}
 
-    plan_df = optimize_plan(
-        forecast_by_product=forecast_df,
+    inv_map_raw = _load_map_json_or_file(args.initial_inventory_map)
+    inv_map: Dict[str, float] = inv_map_raw or {}
+
+    hint_plan = None
+    if args.hint_plan_csv:
+        hint_plan = load_hint_plan_csv(args.hint_plan_csv, scale=args.scale)
+        print(f"[HINT] loaded: {args.hint_plan_csv} | keys={len(hint_plan)}")
+
+    if not args.use_cvar_obj:
+        plan_df, diag = optimize_plan(
+            forecast_by_product=forecast_df,
+            horizons=horizons,
+            prod_col=args.product_col,
+            cluster_info=cluster_info,
+            daily_capacity=args.daily_capacity,
+            lambda_smooth=args.lambda_smooth,
+            initial_inventory=args.initial_inventory,
+            int_production=args.int_production,
+            scale=args.scale,
+            min_lot_map=_load_map_json_or_file(args.min_lot_map),
+            safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
+            weight_map=_load_map_json_or_file(args.weight_map),
+            initial_inventory_map=inv_map,
+            hint_plan=hint_plan,
+            use_cvar_obj=False,
+            solver_seed=args.solver_seed,
+            max_time=args.max_time,
+            workers=args.workers,
+            gap=args.gap,
+            log_progress=args.log_progress,
+        )
+        plan_df.to_csv(args.out_csv, index=False, float_format="%.2f")
+        print(f"[OK] Saved plan: {args.out_csv} (rows={len(plan_df)})")
+        print("[BASIC diag]", diag)
+        return
+
+    scenarios, mc_products = load_mc_scenarios(args.mc_npz, args.mc_csv, product_col=args.product_col)
+    if scenarios is None or mc_products is None:
+        raise ValueError("--use_cvar_obj 사용 시 --mc_npz 또는 --mc_csv 필요")
+
+    forecast_df[args.product_col] = forecast_df[args.product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    forecast_products = forecast_df[args.product_col].tolist()
+    scenarios_re = reorder_mc_scenarios_to_forecast(scenarios, mc_products, forecast_products)
+
+    plan_df, diag, used_loss_scale = _run_optimize_with_fallbacks(
+        forecast_df=forecast_df,
         horizons=horizons,
-        prod_col=args.product_col,
+        args=args,
         cluster_info=cluster_info,
-        daily_capacity=args.daily_capacity,
-        lambda_smooth=args.lambda_smooth,
-        initial_inventory=args.initial_inventory,
-        int_production=args.int_production,
-        scale=args.scale,
-        min_lot_map=_load_map(args.min_lot_map),
-        safety_stock_map=_load_map(args.safety_stock_map),
-        weight_map=_load_map(args.weight_map),
-        initial_inventory_map=inv_map,
+        inv_map=inv_map,
+        scenarios_re=scenarios_re,
+        hint_plan=hint_plan,
+        lam=float(args.lambda_cvar),
+        loss_scale_init=int(args.loss_scale),
     )
+
     plan_df.to_csv(args.out_csv, index=False, float_format="%.2f")
     print(f"[OK] Saved plan: {args.out_csv} (rows={len(plan_df)})")
+    print("[CVaR diag]", diag)
 
 if __name__ == "__main__":
     main()

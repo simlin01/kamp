@@ -1,5 +1,6 @@
 # === Python ===
 __pycache__/
+*.pyc
 *.py[cod]
 *.so
 *.egg
@@ -15,6 +16,7 @@ __pycache__/
 venv/
 env/
 ENV/
+kamp/ 
 
 # === Jupyter ===
 .ipynb_checkpoints/
