@@ -1,0 +1,75 @@
+{
+  "verify": {
+    "ok": true,
+    "issues": [
+      {
+        "type": "INV_BACKLOG_BOTH_POS",
+        "severity": "WARN",
+        "rate": 0.5970695970695971,
+        "note": "CVaR mean plan에서는 시나리오 평균 때문에 동시양수가 자연스럽게 발생할 수 있음."
+      }
+    ]
+  },
+  "fixes": {
+    "suggestions": [
+      {
+        "target": "verifier_rule",
+        "action": "treat_as_warn_for_cvar_mean_plan",
+        "reason": "CVaR 평균 출력에서는 시나리오 평균으로 인해 inv/backlog 동시 양수가 자연스러울 수 있습니다.",
+        "severity": "WARN"
+      }
+    ]
+  },
+  "critique": "",
+  "crosscheck": "",
+  "policy": {
+    "lambda_smooth": 0.6000000000000001,
+    "WEIGHT_MAP": {
+      "0": 6.0,
+      "1": 2.0,
+      "2": 0.5,
+      "3": 1.0
+    },
+    "daily_capacity": null
+  },
+  "need_replan": true,
+  "mc_validation": {
+    "ShortageRate": {
+      "mean": 0.2643364848902884,
+      "VaR": 0.28246704402057005,
+      "worst": 0.3129988251265869
+    },
+    "InventoryRate": {
+      "mean": 0.01690934534220564,
+      "VaR": 0.017731017160121206,
+      "worst": 0.01882882964370194
+    },
+    "Loss": {
+      "mean": 0.2677183539587295,
+      "VaR": 0.28587089964964696,
+      "worst": 0.3161273468875709,
+      "CVaR": 0.29279222546116096
+    },
+    "TotalShortage": {
+      "mean": 30231.925515548428,
+      "VaR": 33219.364672136246,
+      "worst": 38465.7166236851
+    },
+    "AvgInventory": {
+      "mean": 169.0934534220564,
+      "VaR": 177.31017160121206,
+      "worst": 188.2882964370194
+    },
+    "TotalDemand": {
+      "mean": 114250.9004505885,
+      "VaR": 117600.50823786175,
+      "worst": 122894.12462851258
+    },
+    "FailRate": 0.0,
+    "FailThreshold": 0.55,
+    "alpha": 0.9,
+    "S": 200,
+    "P_mean": 117.0,
+    "D_mean": 14.0
+  }
+}

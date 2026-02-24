@@ -1,7 +1,7 @@
 # src/report_llm.py
 # -*- coding: utf-8 -*-
 """
-report_llm.py (revised + fixed)
+report_llm.py (revised + fixed + executive-friendly)
 
 - production_plan.csv / forecast_by_product.csv / metrics_final.csv 기반 주간 리포트 생성
 - Facts(정량 집계)를 LLM에 제공 + Verifier Agent로 JSON 정합성 검증
@@ -17,6 +17,9 @@ B) capa 없으면 0으로 두지 않고 None 처리
 C) planning_metrics.json을 선택 입력으로 받아 Canonical에 반영
 D) FailRate=0이어도 ShortageRate/BacklogRate가 크면 리스크로 표현하도록 신호등 강화
 E) markdown/ matplotlib 의존성 optional 처리 + HTML에 charts 포함
+F) ✅ (NEW) 현업 리포트 기준으로 "분포(hist)"는 기본 OFF:
+   - charts_mode: none | summary | dist
+   - MC per_scenario는 기본 trim(요약만 유지)하여 Facts 노이즈 감소
 """
 
 from __future__ import annotations
@@ -27,7 +30,7 @@ import time
 import argparse
 import requests
 from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
 
 import pandas as pd
 import numpy as np
@@ -177,6 +180,22 @@ def _mc_pick_service_metric(summary: dict) -> Tuple[str, Optional[dict]]:
     return "ShortageRate", None
 
 
+def _trim_mc_validation(mc: Optional[dict], keep_per_scenario: bool) -> Optional[dict]:
+    """
+    현업 보고서에서는 per_scenario(원시 리스트)가 너무 크고 노이즈가 될 수 있음.
+    - 기본: summary만 유지
+    - keep_per_scenario=True 일 때만 per_scenario 유지
+    """
+    if not isinstance(mc, dict):
+        return mc
+    out = dict(mc)
+    # 보통 {"summary":..., "per_scenario":[...]} 형태
+    if not keep_per_scenario:
+        if "per_scenario" in out:
+            out.pop("per_scenario", None)
+    return out
+
+
 # =========================================================
 # 1) Plan 요약 (제품별)
 # =========================================================
@@ -202,17 +221,20 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
     col_inv = _pick(cols, ["end_inventory", "inventory", "inv", "재고"])
     col_day = _pick(cols, ["day_idx", "day"])
 
-    print("[DEBUG] plan(by_product) columns:", list(df.columns))
-    print("[DEBUG] picked(by_product) -> product:", col_prod, "/ qty:", col_prodqty, "/ demand:", col_dem,
-          "/ back:", col_back, "/ inv:", col_inv, "/ day:", col_day)
-
     required = [col_prod, col_prodqty, col_dem]
     if any(x is None for x in required):
         return {
             "missing": False,
             "schema_error": True,
             "columns": list(df.columns),
-            "picked": {"product": col_prod, "produce": col_prodqty, "demand": col_dem, "backlog": col_back, "inventory": col_inv, "day": col_day},
+            "picked": {
+                "product": col_prod,
+                "produce": col_prodqty,
+                "demand": col_dem,
+                "backlog": col_back,
+                "inventory": col_inv,
+                "day": col_day,
+            },
         }
 
     df[col_prod] = df[col_prod].astype(str)
@@ -230,7 +252,9 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
         if not tmp.empty:
             tmp = tmp.sort_values([col_prod, col_day])
             last = tmp.groupby(col_prod, as_index=False).tail(1)
-            inv_last_df = last[[col_prod, col_inv]].rename(columns={col_prod: "Product_Number", col_inv: "end_inventory"})
+            inv_last_df = last[[col_prod, col_inv]].rename(
+                columns={col_prod: "Product_Number", col_inv: "end_inventory"}
+            )
 
     agg = {col_prodqty: "sum", col_dem: "sum"}
     if col_back:
@@ -295,10 +319,6 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
     col_inv = _pick(cols, ["end_inventory", "inv", "inventory", "재고"])
     col_backlog = _pick(cols, ["backlog", "백로그"])
     col_capa = _pick(cols, ["capa", "capacity"])
-
-    print("[DEBUG] plan columns:", list(df.columns))
-    print("[DEBUG] picked -> product:", col_prod, "/ day:", col_day, "/ date_like:", col_date_like,
-          "/ qty:", col_prod_qty, "/ inv:", col_inv, "/ back:", col_backlog, "/ capa:", col_capa)
 
     required = [col_prod, col_prod_qty]
     if any(x is None for x in required):
@@ -378,9 +398,6 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
         prod_prod_sum = g[col_prod_qty].sum()
         approx = prod_prod_sum - (prod_backlog_sum if not prod_backlog_sum.empty else 0.0)
         top_overprod = _topn(approx, n=5, largest=True)
-
-    print("[DEBUG] totals -> prod:", total_prod, "inv:", total_inv, "avg_inv:", avg_inv,
-          "backlog:", total_backlog, "capa:", total_capa, "avg_daily_capa:", avg_daily_capa)
 
     return {
         "missing": False,
@@ -730,43 +747,17 @@ def _extract_llm_exec_commentary(md: str) -> str:
 # =========================================================
 # HTML / Charts
 # =========================================================
-def md_to_html(md_path: str, html_path: str, title: str = "Weekly Report"):
-    if markdown is None:
-        raise RuntimeError("패키지 'markdown'이 필요합니다. pip install markdown")
-
-    md_text = Path(md_path).read_text(encoding="utf-8")
-    body = markdown.markdown(md_text, extensions=["tables", "fenced_code", "toc"])
-
-    html = f"""<!doctype html>
-<html lang="ko">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>{title}</title>
-  <style>
-    body {{ font-family: -apple-system, BlinkMacSystemFont, "Apple SD Gothic Neo", "Malgun Gothic", sans-serif;
-           max-width: 980px; margin: 40px auto; padding: 0 16px; line-height: 1.6; }}
-    table {{ border-collapse: collapse; width: 100%; margin: 16px 0; }}
-    th, td {{ border: 1px solid #ddd; padding: 8px; vertical-align: top; }}
-    th {{ background: #f6f6f6; text-align: left; }}
-    code, pre {{ background: #f3f3f3; padding: 2px 4px; border-radius: 4px; }}
-    pre {{ padding: 12px; overflow: auto; }}
-    hr {{ margin: 24px 0; }}
-  </style>
-</head>
-<body>
-{body}
-</body>
-</html>
-"""
-    Path(html_path).write_text(html, encoding="utf-8")
-
-
-def _charts_from_facts_base64(facts: dict) -> List[Tuple[str, str]]:
+def _charts_from_facts_base64(facts: dict, charts_mode: str) -> List[Tuple[str, str]]:
     """
-    facts 기반으로 (title, base64_png) 리스트 생성.
-    matplotlib 없으면 빈 리스트.
+    charts_mode:
+      - none: []
+      - summary: Top5 bar 위주 (분포(hist) 없음)
+      - dist: 분포(hist) 포함 (디버깅용)
     """
+    charts_mode = (charts_mode or "summary").strip().lower()
+    if charts_mode == "none":
+        return []
+
     try:
         import io
         import base64
@@ -776,47 +767,50 @@ def _charts_from_facts_base64(facts: dict) -> List[Tuple[str, str]]:
 
     charts: List[Tuple[str, str]] = []
 
-    mc = facts.get("mc_validation") or {}
-    per = mc.get("per_scenario") if isinstance(mc, dict) else None
-    if isinstance(per, list) and len(per) > 0:
-        # 1) 서비스 리스크 분포
-        try:
-            sr = [float(x.get("ShortageRate")) for x in per if x.get("ShortageRate") is not None]
-            if not sr:
-                sr = [float(x.get("BacklogRate")) for x in per if x.get("BacklogRate") is not None]
-            if sr:
-                plt.figure()
-                plt.hist(sr, bins=20)
-                plt.title("MC ServiceRisk distribution")
-                plt.xlabel("ShortageRate (or BacklogRate)")
-                plt.ylabel("count")
-                buf = io.BytesIO()
-                plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
-                plt.close()
-                charts.append(("MC 서비스 리스크 분포(Shortage/Backlog)", base64.b64encode(buf.getvalue()).decode("ascii")))
-        except Exception:
-            pass
+    # 1) MC 분포: dist일 때만
+    if charts_mode == "dist":
+        mc = facts.get("mc_validation") or {}
+        per = mc.get("per_scenario") if isinstance(mc, dict) else None
+        if isinstance(per, list) and len(per) > 0:
+            try:
+                sr = [float(x.get("ShortageRate")) for x in per if x.get("ShortageRate") is not None]
+                if not sr:
+                    sr = [float(x.get("BacklogRate")) for x in per if x.get("BacklogRate") is not None]
+                if sr:
+                    plt.figure()
+                    plt.hist(sr, bins=20)
+                    plt.title("MC ServiceRisk distribution")
+                    plt.xlabel("ShortageRate (or BacklogRate)")
+                    plt.ylabel("count")
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+                    plt.close()
+                    charts.append(("MC 서비스 리스크 분포(Shortage/Backlog)", base64.b64encode(buf.getvalue()).decode("ascii")))
+            except Exception:
+                pass
 
-        # 2) Loss 분포
-        try:
-            loss = [float(x.get("Loss")) for x in per if x.get("Loss") is not None]
-            if loss:
-                plt.figure()
-                plt.hist(loss, bins=20)
-                plt.title("MC Loss distribution")
-                plt.xlabel("Loss")
-                plt.ylabel("count")
-                buf = io.BytesIO()
-                plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
-                plt.close()
-                charts.append(("MC Loss 분포", base64.b64encode(buf.getvalue()).decode("ascii")))
-        except Exception:
-            pass
+            try:
+                loss = [float(x.get("Loss")) for x in per if x.get("Loss") is not None]
+                if loss:
+                    plt.figure()
+                    plt.hist(loss, bins=20)
+                    plt.title("MC Loss distribution")
+                    plt.xlabel("Loss")
+                    plt.ylabel("count")
+                    buf = io.BytesIO()
+                    plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
+                    plt.close()
+                    charts.append(("MC Loss 분포", base64.b64encode(buf.getvalue()).decode("ascii")))
+            except Exception:
+                pass
 
+    # 2) 제품 Top5 bar (summary/dist 공통)
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage") or []
     if low_cov:
         try:
+            import io, base64
+            import matplotlib.pyplot as plt  # type: ignore
             labels = [d.get("Product_Number", "?") for d in low_cov[:5]]
             vals = [float(d.get("InvCoverage", 0.0)) for d in low_cov[:5]]
             plt.figure()
@@ -835,6 +829,8 @@ def _charts_from_facts_base64(facts: dict) -> List[Tuple[str, str]]:
     top_over = ps.get("top_overprod") or []
     if top_over:
         try:
+            import io, base64
+            import matplotlib.pyplot as plt  # type: ignore
             labels = [d.get("Product_Number", "?") for d in top_over[:5]]
             vals = [float(d.get("over_score", 0.0)) for d in top_over[:5]]
             plt.figure()
@@ -860,9 +856,13 @@ def md_to_html_with_charts(md_path: str, html_path: str, facts: Optional[dict] =
     md_text = Path(md_path).read_text(encoding="utf-8")
     body = markdown.markdown(md_text, extensions=["tables", "fenced_code", "toc"])
 
+    charts_mode = "summary"
+    if isinstance(facts, dict):
+        charts_mode = (facts.get("_charts_mode") or "summary")
+
     chart_html = ""
     if isinstance(facts, dict) and facts:
-        charts = _charts_from_facts_base64(facts)
+        charts = _charts_from_facts_base64(facts, charts_mode=charts_mode)
         if charts:
             parts = ["<section>", "<h2>자동 생성 그래프</h2>"]
             for t, b64 in charts:
@@ -915,13 +915,9 @@ def verify_report(model_json: dict, facts: dict, cfg: LLMConfig) -> Dict:
 
 
 # =========================================================
-# Canonical renderer
+# Canonical renderer (원본 로직 유지)
 # =========================================================
 def _grade_traffic_light(facts: dict) -> dict:
-    """
-    - 서비스는 deterministic total_backlog + MC(Shortage/Backlog)로 판단
-    - FailRate=0이어도 ShortageRate/BacklogRate(VaR)가 크면 yellow/red 가능
-    """
     rep = facts.get("plan_summary_rep") or {}
     totals = rep.get("totals") or {}
     tl = rep.get("timeline") or {}
@@ -929,7 +925,6 @@ def _grade_traffic_light(facts: dict) -> dict:
 
     total_backlog = float(totals.get("total_backlog", 0.0) or 0.0)
 
-    # util: planning_metrics 우선
     avg_util = pm.get("Utilization_mean", pm.get("Utilization", None))
     if avg_util is None:
         avg_util = tl.get("avg_utilization")
@@ -946,7 +941,6 @@ def _grade_traffic_light(facts: dict) -> dict:
     def _lvl(v):
         return {"green": 0, "yellow": 1, "red": 2}.get(v, 1)
 
-    # service
     if total_backlog > 0:
         service = "red"
     elif sr_v is not None and float(sr_v) >= 0.10:
@@ -956,7 +950,6 @@ def _grade_traffic_light(facts: dict) -> dict:
     else:
         service = "green"
 
-    # inventory
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage") or []
     min_cov = float(low_cov[0].get("InvCoverage", 1.0)) if low_cov else None
@@ -970,7 +963,6 @@ def _grade_traffic_light(facts: dict) -> dict:
     else:
         inventory = "green"
 
-    # capacity
     if avg_util is None:
         capacity = "yellow"
     elif avg_util >= 0.98:
@@ -982,7 +974,6 @@ def _grade_traffic_light(facts: dict) -> dict:
     else:
         capacity = "yellow"
 
-    # forecast (간단)
     ms = facts.get("metrics_summary") or {}
     by_h = ms.get("by_horizon") or []
     r2_t = None
@@ -1093,7 +1084,6 @@ def _render_canonical_md(facts: dict) -> str:
     )
     md.append("")
 
-    # MC summary
     mc = facts.get("mc_validation") or None
     if isinstance(mc, dict) and mc:
         s = mc.get("summary", mc)
@@ -1115,7 +1105,6 @@ def _render_canonical_md(facts: dict) -> str:
         md.append(f"- **FailRate**: {_fmt(s.get('FailRate', 0.0),4)}  (정의: 임계 기준을 넘는 시나리오 비율)")
         md.append("")
 
-    # SKU imbalance
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage", []) or []
     top_over = ps.get("top_overprod", []) or []
@@ -1148,7 +1137,6 @@ def _render_canonical_md(facts: dict) -> str:
         md.append(f"| {d.get('Product_Number','?')} | {_fmt(d.get('over_score',0.0),1)} |")
     md.append("")
 
-    # Forecast metrics
     ms = facts.get("metrics_summary") or {}
     rows = ms.get("by_horizon") or []
     if rows:
@@ -1160,7 +1148,6 @@ def _render_canonical_md(facts: dict) -> str:
             md.append(f"| {r.get('horizon')} | {_fmt(r.get('mae'),4)} | {_fmt(r.get('r2'),4)} |")
         md.append("")
 
-    # Planning metrics (optional)
     if isinstance(pm, dict) and pm:
         md.append("## 6) Planning KPI (metrics.py)")
         md.append("")
@@ -1290,6 +1277,8 @@ def build_report_with_llm(
     max_head_rows: int = 40,
     max_chars: int = 6000,
     auto_regen_on_fail: bool = True,
+    charts_mode: str = "summary",          # ✅ NEW
+    keep_mc_per_scenario: bool = False,    # ✅ NEW (default: trim)
 ) -> Dict:
     cfg = LLMConfig(model=model_name)
 
@@ -1308,7 +1297,8 @@ def build_report_with_llm(
     product_summary = summarize_by_product(plans[0]) if plans else {}
 
     pm = _load_json_if_exists(planning_metrics_json) if planning_metrics_json else None
-    mc_summary = _load_json_if_exists(mc_json) if mc_json else None
+    mc_raw = _load_json_if_exists(mc_json) if mc_json else None
+    mc_summary = _trim_mc_validation(mc_raw, keep_per_scenario=keep_mc_per_scenario)
 
     facts = {
         "plan_scenarios": plans_summary,
@@ -1318,9 +1308,9 @@ def build_report_with_llm(
         "product_summary": product_summary,
         "mc_validation": mc_summary,
         "planning_metrics": pm,
+        "_charts_mode": charts_mode,  # html 렌더러 전달
     }
     facts["rule_based_actions"] = generate_rule_based_actions(facts)
-    print("[DEBUG] actions:", facts.get("rule_based_actions"))
 
     samples: List[str] = []
     if plans:
@@ -1381,7 +1371,6 @@ def _ensure_parent_dir(path: str):
 
 
 def main():
-    print("[DEBUG] report_llm.py main() entered")
     p = argparse.ArgumentParser(description="Weekly report generator (LLM-augmented)")
     p.add_argument("--plan", help="production_plan.csv 경로 (단일)")
     p.add_argument("--plans", help="쉼표(,)로 구분된 production_plan.csv 경로 목록")
@@ -1396,6 +1385,13 @@ def main():
     p.add_argument("--no_regen", action="store_true", help="검증 실패 시 재생성 비활성화")
     p.add_argument("--feat", default="./data/feat.csv", help="(유지) features.py가 만든 feat.csv 경로")
     p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로")
+
+    # ✅ NEW: charts / mc trim 옵션
+    p.add_argument("--charts_mode", default="summary", choices=["none", "summary", "dist"],
+                   help="HTML에 포함할 차트 수준: none(없음) | summary(Top5) | dist(분포까지)")
+    p.add_argument("--keep_mc_per_scenario", action="store_true",
+                   help="MC JSON의 per_scenario를 Facts에 유지(기본은 trim하여 summary만 사용)")
+
     args = p.parse_args()
 
     plans = [s.strip() for s in args.plans.split(",") if s.strip()] if args.plans else []
@@ -1412,6 +1408,8 @@ def main():
         auto_regen_on_fail=not args.no_regen,
         mc_json=args.mc_json or "",
         planning_metrics_json=args.planning_metrics_json or "",
+        charts_mode=args.charts_mode,
+        keep_mc_per_scenario=bool(args.keep_mc_per_scenario),
     )
 
     if out.get("markdown") is not None:
@@ -1420,12 +1418,8 @@ def main():
             f.write(out["markdown"])
 
         out_html = str(Path(args.out_md).with_suffix(".html"))
-        print("[DEBUG] out_md:", args.out_md)
-        print("[DEBUG] out_html:", out_html)
-
         try:
             _ensure_parent_dir(out_html)
-            # ✅ charts 포함 HTML
             md_to_html_with_charts(args.out_md, out_html, facts=out.get("facts"), title="주간 운영 계획 보고서")
             print(f"[OK] Saved HTML:\n- {out_html}")
         except Exception as e:

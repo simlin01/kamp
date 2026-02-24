@@ -4,20 +4,20 @@
 """
 forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
 
-[이번 수정 핵심]
-1) ✅ planner 입력(pred_final_by_product.csv)과 MC 기준(d_hat)의 "시점 기준"을 일치
-   - 기존: pred_all 전체 기간 평균으로 제품별 집계(aggregate_by_product)
-   - 변경: 제품별 최신 DateTime 스냅샷(snapshot_latest_by_product)으로 저장
-   -> planner_opt의 입력과 MC 검증 기준점을 동일하게 맞춤
+[핵심 수정(정합성/안정성)]
+1) ✅ Target 탐지 통일: "예상/예정 수주량" 모두 지원 + horizon 정렬 강건화
+   - utils.py의 규칙과 동일한 정규식 기반 파싱으로 통일
 
-2) ✅ MC 시나리오 생성에서 horizon 간 상관관계를 보존
-   - 기존: horizon별 잔차를 독립 resample (상관 깨짐)
-   - 변경: 잔차 벡터(행)를 통째로 resample하여 (S,n,k)로 생성 (상관 유지)
+2) ✅ Leakage 방지 규칙 보강:
+   - is_future_plan / is_any_prediction 에서 "예정/예상" 모두 제외
+   - 작년/전년/지난해는 예외 처리 유지
 
-3) ✅ (NEW) MC 평균 바이어스 완화(캘리브레이션)
-   - residual clip 이후 horizon별 잔차 평균을 0으로 center
-   - MC 시나리오 평균이 point forecast(d_hat)에 더 가깝게 맞도록 유도
-   - planner 입력(d_hat) 대비 MC 평균이 과도하게 높아져 FillRate가 구조적으로 깎이는 현상 완화
+3) ✅ planner 입력(pred_final_by_product.csv)과 MC 기준(d_hat)의 "시점 기준"을 일치
+   - snapshot_latest_by_product()를 기본으로 사용
+   - aggregate_by_product()는 참고용 유지
+
+4) ✅ MC 시나리오: horizon 상관 보존(벡터 resample) + 평균 바이어스 완화(센터링)
+   - residual clip 후 horizon별 평균 0으로 center
 
 (그 외 로직/CLI/파일 포맷은 최대한 그대로 유지)
 """
@@ -58,7 +58,9 @@ except Exception:
 
 DEFAULT_PROD_COL = "Product_Number"
 DEFAULT_DT_COL   = "DateTime"
-TARGET_KEYWORDS  = ["예상 수주량"]
+
+# ✅ 예상/예정 모두 기본 키워드로
+TARGET_KEYWORDS  = ["예상 수주량", "예정 수주량"]
 
 
 # =========================================================
@@ -90,30 +92,67 @@ def save_best_params(path: str | Path, params: Dict) -> None:
 # =========================================================
 # Target / Feature utils
 # =========================================================
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+def _extract_horizon_index(col: str) -> Optional[int]:
+    """
+    - "T일 ..." -> 0
+    - "T+3일 ..." -> 3
+    - 축약형 "T" -> 0
+    - 축약형 "T+3" -> 3
+    """
+    c = _norm(col)
+    if re.fullmatch(r"T", c):
+        return 0
+    m = re.fullmatch(r"T\+(\d+)", c)
+    if m:
+        return int(m.group(1))
+    if "T일" in c:
+        return 0
+    m2 = re.search(r"T\+(\d+)\s*일", c)
+    if m2:
+        return int(m2.group(1))
+    m3 = re.search(r"T\+(\d+)", c)
+    if m3:
+        return int(m3.group(1))
+    return None
+
 def find_target_cols(df: pd.DataFrame, keywords: List[str]) -> List[str]:
-    cols = [c for c in df.columns if any(k in c for k in keywords)]
-    def _key(x: str):
-        # "T일", "T+3일" 형태를 기대 (데이터에 맞게 필요시 수정)
-        m = re.search(r"T\+?(\d*)일", x)
-        return int(m.group(1) or 0) if m else 0
-    return sorted(cols, key=_key)
+    """
+    keywords(예: ["예상 수주량","예정 수주량"]) 중 하나라도 포함 + T일/T+ 포함 컬럼을 타깃으로 간주.
+    horizon index 기준으로 안정 정렬.
+    """
+    cands = []
+    for c in df.columns:
+        cc = _norm(c)
+        if any(k in cc for k in keywords) and (("T일" in cc) or ("T+" in cc) or re.search(r"\bT(\+\d+)?\b", cc)):
+            cands.append(c)
+
+    with_h = []
+    for c in cands:
+        h = _extract_horizon_index(c)
+        if h is not None:
+            with_h.append((h, c))
+    no_h = [c for c in cands if _extract_horizon_index(c) is None]
+
+    out = [c for h, c in sorted(with_h, key=lambda x: x[0])] + no_h
+    return out
 
 def select_feature_columns(df: pd.DataFrame, prod_col: str, target_cols: List[str]) -> Tuple[List[str], List[str]]:
     numeric_all = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
     excluded: List[str] = []
 
     def is_future_plan(col: str) -> bool:
-        if "예정 수주량" in col:
+        # ✅ "예정/예상" 둘 다 미래 계획/예측 계열로 간주 (누출 방지)
+        if ("예정 수주량" in col) or ("예상 수주량" in col):
             if any(tag in col for tag in ["작년", "전년", "지난해"]):
                 return False
             return True
         return False
 
-    def is_any_prediction(col: str) -> bool:
-        return ("예상 수주량" in col)
-
     for c in list(numeric_all):
-        if c in target_cols or c == prod_col or is_future_plan(c) or is_any_prediction(c):
+        if c in target_cols or c == prod_col or is_future_plan(c):
             excluded.append(c)
 
     num_cols = [c for c in numeric_all if c not in set(excluded + [prod_col])]
@@ -254,7 +293,7 @@ def generate_demand_scenarios(
     horizon 간 상관관계를 보존한다.
 
     d_hat: (n, k)
-    residuals: (m, k)  (y_true - y_pred)
+    residuals: (m, k)  (y_true - y_pred), horizon별 mean=0 (권장)
     return: (S, n, k)
     """
     rng = np.random.default_rng(seed)
@@ -429,10 +468,6 @@ def _parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
     return out
 
 def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
-    """
-    멀티시드 튜닝:
-      objective(trial) = agg_{seed in seeds} [ w_mae * norm_mae + w_smape * smape ]
-    """
     if optuna is None:
         print("Optuna 미설치: 튜닝을 건너뜁니다.")
         return None
@@ -517,11 +552,6 @@ def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
 # Residual pool (OPTION) + residual clip
 # =========================================================
 def _clip_residuals(residuals: np.ndarray, q: float) -> np.ndarray:
-    """
-    잔차 tail 과대 방지용 clip.
-    - q=0이면 비활성
-    - q in (0.5, 1.0): 각 horizon별로 [q_low, q_high] 분위수로 clip
-    """
     if q is None or q <= 0:
         return residuals
     q = float(q)
@@ -542,10 +572,6 @@ def build_residual_pool(
     args, df, X, y, model_factory,
     repeats: int = 1
 ) -> Tuple[pd.DataFrame, np.ndarray]:
-    """
-    residual_pool=multi: seed를 바꿔 residual pool 누적.
-    (time split은 cutoff 고정이라 반복 의미가 작을 수 있음)
-    """
     repeats = int(max(1, repeats))
     all_res = []
     metrics_last = None
@@ -591,14 +617,11 @@ def main():
     # tuning
     ap.add_argument("--tune", action="store_true")
     ap.add_argument("--trials", type=int, default=30)
-    ap.add_argument("--tune_seeds", type=int, default=1,
-                    help="멀티시드 튜닝 시 seed 개수 (seed, seed+1, ...). 예: 10")
-    ap.add_argument("--tune_seed_list", type=str, default=None,
-                    help="멀티시드 튜닝 seed 리스트. 예: '2025,2026,2027,...' (지정 시 tune_seeds 무시)")
-    ap.add_argument("--tune_agg", type=str, default="mean", choices=["mean", "median"],
-                    help="멀티시드 score 집계 방식")
-    ap.add_argument("--w_mae", type=float, default=0.5, help="tuning objective 가중치 (MAE)")
-    ap.add_argument("--w_smape", type=float, default=0.5, help="tuning objective 가중치 (SMAPE)")
+    ap.add_argument("--tune_seeds", type=int, default=1)
+    ap.add_argument("--tune_seed_list", type=str, default=None)
+    ap.add_argument("--tune_agg", type=str, default="mean", choices=["mean", "median"])
+    ap.add_argument("--w_mae", type=float, default=0.5)
+    ap.add_argument("--w_smape", type=float, default=0.5)
 
     ap.add_argument("--deterministic", action="store_true")
 
@@ -606,20 +629,15 @@ def main():
     ap.add_argument("--save_best_params", action="store_true")
 
     # residual pool options
-    ap.add_argument("--residual_pool", default="val", choices=["val", "multi"],
-                    help="val=단일 split residual, multi=여러 seed 반복(residual pool 확대)")
-    ap.add_argument("--residual_runs", type=int, default=1,
-                    help="residual_pool=multi일 때 반복 횟수 (예: 5~20)")
-    ap.add_argument("--res_clip_q", type=float, default=0.0,
-                    help="잔차 분위수 clip(0 비활성). 예: 0.995 → [0.5%, 99.5%]로 horizon별 clip")
+    ap.add_argument("--residual_pool", default="val", choices=["val", "multi"])
+    ap.add_argument("--residual_runs", type=int, default=1)
+    ap.add_argument("--res_clip_q", type=float, default=0.0)
 
     # MC options
-    ap.add_argument("--mc_scenarios", type=int, default=0, help="MC scenario count (0 disables)")
-    ap.add_argument("--mc_out", default=None, help="Path to save MC scenarios (.npz). default: <out>_mc.npz")
-    ap.add_argument("--mc_mode", default="raw", choices=["raw", "product"],
-                    help="raw=pred_all rows (NPZ), product=latest snapshot by product (NPZ + long CSV)")
-    ap.add_argument("--mc_out_csv", default=None,
-                    help="Path to save MC scenarios as long CSV. default: <out>_mc.csv")
+    ap.add_argument("--mc_scenarios", type=int, default=0)
+    ap.add_argument("--mc_out", default=None)
+    ap.add_argument("--mc_mode", default="raw", choices=["raw", "product"])
+    ap.add_argument("--mc_out_csv", default=None)
 
     args = ap.parse_args()
 
@@ -667,10 +685,7 @@ def main():
             random_state=args.seed,
         )
         if args.deterministic:
-            lgbm_params_base.update(dict(
-                deterministic=True,
-                force_row_wise=True,
-            ))
+            lgbm_params_base.update(dict(deterministic=True, force_row_wise=True))
 
         def model_factory(seed_override: Optional[int] = None) -> Pipeline:
             params = dict(lgbm_params_base)
@@ -717,10 +732,9 @@ def main():
         )
         print(f"[INFO] residual_pool=val, pool_shape={residuals_pool.shape}")
 
-    # residual clip (tail 과대 방지)
     residuals_pool = _clip_residuals(residuals_pool, args.res_clip_q)
 
-    # ✅ (NEW) horizon별 residual mean 제거 → MC 평균 바이어스 완화
+    # ✅ horizon별 residual mean 제거 → MC 평균 바이어스 완화
     residuals_pool = residuals_pool - residuals_pool.mean(axis=0, keepdims=True)
 
     print("Validation metrics")
@@ -732,7 +746,7 @@ def main():
         print(f"저장: {args.metrics_out}")
 
     # -------------------------
-    # (D) (FIX) 전체 데이터 refit 후 최종 예측
+    # (D) 전체 데이터 refit 후 최종 예측
     # -------------------------
     final_model = model_factory(seed_override=args.seed)
     final_model.fit(X, y.values)
@@ -772,7 +786,7 @@ def main():
                 scenarios=scenarios,
                 products=products,
                 out_csv=mc_out_csv,
-                product_col_name="Product_Number",
+                product_col_name=args.prod_col,
             )
             print(f"MC scenarios (long CSV) saved: {mc_out_csv}")
 

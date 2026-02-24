@@ -4,28 +4,19 @@
 """
 planner_opt.py — CP-SAT 생산계획 (CVaR objective)
 
-[UPDATED - 핵심(정합성/안정성)]
-1) UB 타이트닝 유지
-2) ✅ CVaR 손실을 evaluator와 "완전히 동일한 정의"로 맞춤 (rate 기반)
-   - shortage = backlog 증가분(= 신규 미충족)
-   - TotalShortage_s = sum(shortage)
-   - ShortageRate_s  = TotalShortage_s / TotalDemand_s
-   - InventoryRate_s = (AvgInventory_s / daily_capacity)
-                     = (sum_inv_s/(P*D)) / day_cap
-   - Loss_s = wb * ShortageRate_s + wi * InventoryRate_s
-   - CP-SAT에서는 rate를 loss_scale 기준 정수로 만들기 위해 AddDivisionEquality 사용
-3) ✅ CVaR는 loss_int_s(=Loss_s * loss_scale)의 tail 평균으로 선형화
-4) ✅ objective 단위 통일:
-   - mean_loss_int (0..loss_scale)
-   - cvar_avg_int  (0..~2*loss_scale)
-   => lambda_scale을 너무 크게 잡아 overflow 나는 문제를 구조적으로 완화
-5) ✅ smooth 페널티 스케일: BASIC/CVaR 모두 lambda_smooth*100 통일
-6) ✅ inv/backlog reified 제거:
-   - stock(음수 가능) 한 개로 상태방정식 구성
-   - inv = max(stock,0), backlog = max(-stock,0)
-7) ✅ (중요) Warm-start AddHint 지원:
-   - --hint_plan_csv 로 이전 feasible plan(예: minlotfix_only)을 힌트로 주면
-     wb/λ 강화 시 UNKNOWN(해 탐색 실패) 확률을 크게 줄임
+[핵심 수정]
+1) ✅ detect_horizons()를 한국어 컬럼에서도 "항상" 올바른 순서로 정렬
+   - _sort_horizons_kor()를 실제로 적용 (기존: 정의만 있고 미사용)
+   - "T일 예상/예정 수주량", "T+3일 ..." 같은 케이스에서 day_idx 축 꼬임 방지
+2) ✅ preprocess_forecast()를 prod_col 인자로 받아 main/forecast와 컬럼명 통일
+   - (기존: Product_Number 고정)
+3) ✅ load_cluster_info()도 prod_col 인자화 + 결측 클러스터 안전 처리
+4) ✅ detect_horizons 후보 수집 로직을 정규식 기반으로 단순/강건화
+   - "T", "T+3" 같은 축약 컬럼
+   - "T일 예상 수주량", "T+3일 예정 수주량" 같은 한국어 풀네임 컬럼
+   - 기타 "T+3 ..." 부분 문자열 포함 컬럼
+
+※ 최적화 모델(CVaR 정의/로직)은 사용자가 주신 버전을 유지(정합성 목적).
 """
 
 from __future__ import annotations
@@ -43,15 +34,6 @@ from ortools.sat.python import cp_model
 # (A) Utils & Preprocess
 # =========================================================
 
-def _sort_horizons_kor(hs: List[str]) -> List[str]:
-    def key(h: str) -> int:
-        s = str(h)
-        if s.startswith("T일"):
-            return 0
-        m = re.search(r"T\+(\d+)", s)
-        return int(m.group(1)) if m else 10_000
-    return sorted(hs, key=key)
-
 WEIRD_SPACES = ["\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"]
 
 def _normalize_col(c: str) -> str:
@@ -61,63 +43,119 @@ def _normalize_col(c: str) -> str:
     c2 = re.sub(r"\s+", " ", c2).strip()
     return c2
 
-def preprocess_forecast(df: pd.DataFrame) -> pd.DataFrame:
+
+def _sort_horizons_kor(hs: List[str]) -> List[str]:
+    """
+    한국어 horizon 컬럼까지 안정 정렬:
+    - "T일 ..." -> 0
+    - "T+1일 ..." -> 1
+    - 축약형 "T" -> 0, "T+3" -> 3
+    """
+    def key(h: str) -> int:
+        s = _normalize_col(h)
+
+        # 축약형
+        if s == "T":
+            return 0
+        m0 = re.fullmatch(r"T\+(\d+)", s)
+        if m0:
+            return int(m0.group(1))
+
+        # 한국어 풀네임
+        if s.startswith("T일"):
+            return 0
+        m = re.search(r"T\+(\d+)", s)
+        if m:
+            return int(m.group(1))
+
+        # 혹시 "T+3일"처럼 붙어있어도 잡힘
+        m2 = re.search(r"T\+(\d+)\s*일", s)
+        if m2:
+            return int(m2.group(1))
+
+        return 10_000
+
+    # 중복 제거 + 안정 정렬
+    hs_u = list(dict.fromkeys(hs))
+    return sorted(hs_u, key=key)
+
+
+def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_col: str = "DateTime") -> pd.DataFrame:
+    """
+    - 컬럼 normalize
+    - DateTime이 있으면 제품별 최신 스냅샷으로 축약
+    - DateTime이 없으면 그대로(이미 product-level이면 OK)
+    """
     df = df.copy()
     df.columns = [_normalize_col(c) for c in df.columns]
 
-    if "Product_Number" not in df.columns:
-        raise KeyError(f"'Product_Number' 컬럼이 없습니다. 현재 컬럼: {list(df.columns)}")
+    if prod_col not in df.columns:
+        raise KeyError(f"'{prod_col}' 컬럼이 없습니다. 현재 컬럼: {list(df.columns)}")
 
-    # DateTime 없으면 그대로(이미 product-level이면 OK)
-    if "DateTime" not in df.columns:
+    if dt_col not in df.columns:
         return df
 
-    df["DateTime"] = pd.to_datetime(df["DateTime"], errors="coerce")
-    valid = df.dropna(subset=["DateTime"])
+    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
+    valid = df.dropna(subset=[dt_col])
     if valid.empty:
-        return df.drop(columns=["DateTime"], errors="ignore")
+        return df.drop(columns=[dt_col], errors="ignore")
 
     latest_dt = (
-        valid.groupby("Product_Number", as_index=False)["DateTime"].max()
-             .rename(columns={"DateTime": "_LatestDT"})
+        valid.groupby(prod_col, as_index=False)[dt_col].max()
+             .rename(columns={dt_col: "_LatestDT"})
     )
-    merged = df.merge(latest_dt, on="Product_Number", how="inner")
-    picked = merged[merged["DateTime"] == merged["_LatestDT"]].copy()
+    merged = df.merge(latest_dt, on=prod_col, how="inner")
+    picked = merged[merged[dt_col] == merged["_LatestDT"]].copy()
 
     num_cols = picked.select_dtypes(include="number").columns.tolist()
     non_num_cols = [c for c in picked.columns if c not in num_cols]
-    agg = {**{c: "first" for c in non_num_cols}, **{c: "mean" for c in num_cols}}
-    snapped = picked.groupby("Product_Number", as_index=False).agg(agg)
-    return snapped.drop(columns=["_LatestDT", "DateTime"], errors="ignore")
 
-def load_cluster_info(feat_file: str) -> Dict[str, int]:
+    # num mean / others first
+    agg = {**{c: "first" for c in non_num_cols}, **{c: "mean" for c in num_cols}}
+    snapped = picked.groupby(prod_col, as_index=False).agg(agg)
+    return snapped.drop(columns=["_LatestDT", dt_col], errors="ignore")
+
+
+def load_cluster_info(feat_file: str, prod_col: str = "Product_Number") -> Dict[str, int]:
+    """
+    feat.csv에서 제품별 Cluster 매핑 로드.
+    - Cluster 없으면 전체 1로 처리(안전)
+    """
     df = pd.read_csv(feat_file)
     df.columns = [_normalize_col(c) for c in df.columns]
-    if "Product_Number" not in df.columns or "Cluster" not in df.columns:
-        raise ValueError("feat.csv에는 'Product_Number', 'Cluster' 컬럼이 필요합니다.")
-    m = df[["Product_Number", "Cluster"]].drop_duplicates()
-    return m.set_index("Product_Number")["Cluster"].to_dict()
+
+    if prod_col not in df.columns:
+        raise ValueError(f"feat.csv에는 '{prod_col}' 컬럼이 필요합니다.")
+
+    if "Cluster" not in df.columns:
+        print("[WARN] feat.csv에 'Cluster' 컬럼이 없습니다. 모든 제품을 Cluster=1로 처리합니다.")
+        return {str(p): 1 for p in df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()}
+
+    m = df[[prod_col, "Cluster"]].drop_duplicates()
+    m[prod_col] = m[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    m["Cluster"] = pd.to_numeric(m["Cluster"], errors="coerce").fillna(1).astype(int)
+    return m.set_index(prod_col)["Cluster"].to_dict()
 
 # =========================================================
 # (A-1) Warm-start Hint loader
 # =========================================================
 
-def load_hint_plan_csv(path: str, scale: int = 10) -> Dict[Tuple[str, int], int]:
+def load_hint_plan_csv(path: str, scale: int = 10, prod_col: str = "Product_Number") -> Dict[Tuple[str, int], int]:
     """
     hint plan CSV -> {(Product_Number, day_idx): produce_int_scaled}
     """
     df = pd.read_csv(path)
-    need = {"Product_Number", "day_idx", "produce"}
+    need = {prod_col, "day_idx", "produce"}
     if not need.issubset(df.columns):
         raise ValueError(f"hint_plan_csv에는 {sorted(need)} 컬럼이 필요합니다. 현재={list(df.columns)}")
 
-    df["Product_Number"] = df["Product_Number"].astype(str).str.replace(r"\.0$", "", regex=True)
+    df[prod_col] = df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
     df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
     df["produce"] = pd.to_numeric(df["produce"], errors="coerce").fillna(0.0)
 
     m: Dict[Tuple[str, int], int] = {}
     for r in df.itertuples(index=False):
-        p = str(r.Product_Number)
+        p = str(getattr(r, prod_col))
         d = int(r.day_idx)
         v = int(round(float(r.produce) * scale))
         if v < 0:
@@ -186,6 +224,7 @@ def load_mc_scenarios(
 
     return None, None
 
+
 def reorder_mc_scenarios_to_forecast(
     scenarios: np.ndarray,
     mc_products: List[str],
@@ -199,26 +238,35 @@ def reorder_mc_scenarios_to_forecast(
             out[:, j, :] = scenarios[:, mc_index[p], :]
     return out
 
+
 def detect_horizons(df: pd.DataFrame) -> List[str]:
-    candidates = []
+    """
+    horizon 컬럼 후보를 강건하게 수집하고,
+    ✅ 반드시 _sort_horizons_kor()로 정렬해서 반환.
+    """
+    candidates: List[str] = []
+
+    # 1) 축약형: "T", "T+1" ...
     for c in df.columns:
         cc = _normalize_col(c)
         if re.fullmatch(r"T(\+\d+)?", cc):
             candidates.append(c)
-        elif ("T" in cc and "예상" in cc) or ("T" in cc and "수주" in cc):
+
+    # 2) 한국어 풀네임: "T일 예상/예정 수주량", "T+3일 ..." 등
+    rgx_full = re.compile(r"^T(\+\d+)?일\s*(예상|예정)?\s*.*$")  # 예상/예정 없어도 허용
+    for c in df.columns:
+        cc = _normalize_col(c)
+        if rgx_full.match(cc) and ("수주" in cc or "예상" in cc or "예정" in cc):
             candidates.append(c)
 
-    def _key(x: str) -> int:
-        s = _normalize_col(x)
-        if s == "T":
-            return 0
-        m = re.match(r"T\+(\d+)", s)
-        if m:
-            return int(m.group(1))
-        m2 = re.search(r"T\+(\d+)", s)
-        return int(m2.group(1)) if m2 else 10_000
+    # 3) 마지막 fallback: "T+숫자"가 포함된 컬럼
+    for c in df.columns:
+        cc = _normalize_col(c)
+        if re.search(r"T\+\d+", cc):
+            candidates.append(c)
 
-    candidates = sorted(set(candidates), key=_key)
+    candidates = _sort_horizons_kor(list(dict.fromkeys(candidates)))
+
     if not candidates:
         raise ValueError("horizons 자동 감지 실패. --horizons 로 명시해 주세요.")
     return candidates
@@ -300,7 +348,7 @@ def optimize_plan(
     safety_stock_map = safety_stock_map or {0: 0, 1: 0, 2: 0, 3: 0}
     weight_map = weight_map or {0: 5.0, 1: 2.0, 2: 0.5, 3: 1.0}
 
-    df = preprocess_forecast(forecast_by_product)
+    df = preprocess_forecast(forecast_by_product, prod_col=prod_col, dt_col="DateTime")
     df[prod_col] = df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
 
     products = df[prod_col].tolist()
@@ -504,9 +552,6 @@ def optimize_plan(
 
     # =====================================================
     # Rate-based loss (evaluator와 1:1 일치)
-    #   short_rate_int[s] = TotalShortage_s * loss_scale / TotalDemand_s
-    #   inv_rate_int[s]   = SumInv_s * loss_scale / (P*D*day_cap)
-    #   loss_int_s        = floor((wb*short + wi*inv) * loss_scale)
     # =====================================================
     total_dem_i = mc_demand_i.sum(axis=(1, 2)).astype(int)  # (S,)
     total_dem_i = np.maximum(total_dem_i, 1)
@@ -520,7 +565,6 @@ def optimize_plan(
         model.AddDivisionEquality(short_rate_int[s], total_short_s[s] * int(loss_scale), int(total_dem_i[s]))
         model.AddDivisionEquality(inv_rate_int[s],   sum_inv_s[s]     * int(loss_scale), int(denom_inv))
 
-    # 실수 가중치 -> 정수 가중치
     WDEN = 1000
     wb_w = max(0, int(round(mc_wb * WDEN)))
     wi_w = max(0, int(round(mc_wi * WDEN)))
@@ -570,7 +614,7 @@ def optimize_plan(
     if smooth_w > 0:
         for i in range(P):
             for d in range(1, D):
-                diff = model.NewIntVar(0, DIFF_UB, f"diff_{i}_{d}")
+                diff = model.NewIntVar(0, day_cap, f"diff_{i}_{d}")
                 model.Add(diff >= produce[i][d] - produce[i][d-1])
                 model.Add(diff >= produce[i][d-1] - produce[i][d])
                 base_terms.append(smooth_w * diff)
@@ -626,7 +670,7 @@ def optimize_plan(
         "gap": float(gap),
         "workers": int(workers),
         "STATE_UB": int(STATE_UB),
-        "PROD_UB": int(PROD_UB),
+        "PROD_UB": int(day_cap),
         "smooth_w": int(smooth_w),
         "wb_w": int(wb_w),
         "wi_w": int(wi_w),
@@ -683,9 +727,7 @@ def _run_optimize_with_fallbacks(
                 safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
                 weight_map=_load_map_json_or_file(args.weight_map),
                 initial_inventory_map=inv_map,
-
                 hint_plan=hint_plan,
-
                 use_cvar_obj=True,
                 mc_scenarios=scenarios_re,
                 cvar_alpha=args.cvar_alpha,
@@ -694,7 +736,6 @@ def _run_optimize_with_fallbacks(
                 mc_wb=args.mc_wb,
                 mc_wi=args.mc_wi,
                 loss_scale=int(cfg["loss_scale"]),
-
                 solver_seed=args.solver_seed,
                 max_time=float(cfg["max_time"]),
                 workers=int(cfg["workers"]),
@@ -759,17 +800,18 @@ def main():
     args = ap.parse_args()
 
     pred = pd.read_csv(args.in_csv)
-    cluster_info = load_cluster_info(args.feat_csv)
+    cluster_info = load_cluster_info(args.feat_csv, prod_col=args.product_col)
 
-    forecast_df = preprocess_forecast(pred)
+    forecast_df = preprocess_forecast(pred, prod_col=args.product_col, dt_col="DateTime")
     horizons = args.horizons or detect_horizons(forecast_df)
+    horizons = _sort_horizons_kor(horizons)  # ✅ 최종 안전 정렬
 
     inv_map_raw = _load_map_json_or_file(args.initial_inventory_map)
     inv_map: Dict[str, float] = inv_map_raw or {}
 
     hint_plan = None
     if args.hint_plan_csv:
-        hint_plan = load_hint_plan_csv(args.hint_plan_csv, scale=args.scale)
+        hint_plan = load_hint_plan_csv(args.hint_plan_csv, scale=args.scale, prod_col=args.product_col)
         print(f"[HINT] loaded: {args.hint_plan_csv} | keys={len(hint_plan)}")
 
     if not args.use_cvar_obj:

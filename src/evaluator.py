@@ -6,34 +6,24 @@ evaluator.py
 
 - 통합 감사(Audit): 규칙 기반 검증 + (옵션) LLM 기반 자기평가/상호검증
 - 정책 학습(Policy): 성과 기반 파라미터 자동 업데이트, 저장/로딩
-- MC 시나리오 검증(ShortageRate 기반, planner_opt.py와 1:1 정합):
-    * 입력: mc_scenarios_csv (scenario_id, day_idx, Product_Number, demand)
-    * 고정 생산계획(plan_df)을 시나리오 수요에 대해 시뮬레이션하여
-      "미충족(Shortage)" 기반 리스크 요약 저장
+- MC 시나리오 검증(ShortageRate 기반, planner_opt.py와 1:1 정합)
 
-[정합성 규칙: planner_opt와 동일]
-- TotalShortage = sum(shortage)  (누적 미충족)
-- ShortageRate  = TotalShortage / TotalDemand
-- AvgInventory  = sum(end_inventory)/(P*D)   (product-day 평균 재고)
-- InventoryRate = AvgInventory / daily_capacity
-- Loss          = wb * ShortageRate + wi * InventoryRate
+[이번 수정 핵심]
+1) ✅ Product 컬럼/이름 정합성 강화:
+   - load_mc_scenarios / simulate_fixed_plan / mc_validate_plan 모두 product_col 인자 지원
+   - main.py에서 prod_col 바꿔도 evaluator가 깨지지 않게 방어
 
-[요약 지표]
-- Loss: mean / VaR(alpha) / CVaR(alpha) / worst
-- ShortageRate/InventoryRate 등: mean / VaR(alpha) / worst  (CVaR는 Loss만 제공)
+2) ✅ MC 시뮬레이션 shortage 정의를 planner_opt와 "완전히 동일하게" 맞춤:
+   - simulate_fixed_plan에서 shortage = backlog 증가분(신규 미충족)으로 계산/저장
+   - 기존 코드의 shortage = demand - fulfilled (일별 미충족량) 방식은
+     backlog 증가분과 값이 같아 보이지만, 경계/재계산/집계에서 오차가 날 수 있어
+     아예 backlog 기반으로 동일하게 구현
 
-[FailRate]
-- ShortageRate > fail_threshold 인 시나리오 비율
+3) ✅ CVaR mean plan에서 schema/규칙 검증 완화는 유지하되,
+   - shortage 컬럼이 있으면 CVaR mean plan으로 간주 (기존 유지)
+   - INV_BACKLOG_BOTH_POS는 CVaR mean plan이면 WARN 처리
 
-[강건성 개선]
-- product/day 커버리지 불일치 자동 보정(outer join + 0 fill)
-- (products × days) 그리드를 만들어 simulate 시 누락 일자 방지
-- Utilization이 metrics_json에 없으면 plan에서 직접 추정 가능
-
-[중요 수정]
-- CVaR plan 출력은 (시나리오 평균) end_inventory/backlog가 동시에 양수로 보일 수 있음
-  (시나리오 A는 inv>0, 시나리오 B는 backlog>0 → 평균은 둘 다 >0).
-  따라서 INV_BACKLOG_BOTH_POS는 CVaR plan에서는 ERROR가 아니라 WARN로 처리.
+4) ✅ (products × days) 그리드 생성 로직은 유지 + day 커버리지 불일치 방어 강화
 """
 
 from __future__ import annotations
@@ -80,18 +70,10 @@ def _ensure_cols(df: pd.DataFrame, cols: List[str], fill: float = 0.0) -> pd.Dat
 # 규칙 기반 Verifier
 # =========================================================
 def _is_cvar_mean_plan(plan_df: pd.DataFrame) -> bool:
-    """
-    CVaR 모드 출력(plan_df)의 전형적 특징:
-    - shortage 컬럼이 존재 (planner_opt CVaR 출력이 shortage 평균을 넣음)
-    - 또는 backlog/end_inventory가 '평균값'일 가능성이 높아 둘 다 양수 문제 발생 가능
-    """
-    if "shortage" in plan_df.columns:
-        return True
-    # 매우 보수적으로: backlog/end_inventory 둘 다 있고, 값이 연속형(평균치)처럼 보이면 True로 볼 수도 있지만
-    # 여기서는 shortage 존재만으로 충분히 처리 (안전하게).
-    return False
+    # shortage 컬럼 존재 -> CVaR 평균 plan으로 간주
+    return ("shortage" in plan_df.columns)
 
-def verify_plan(plan_df: pd.DataFrame, daily_capacity: float) -> Dict[str, Any]:
+def verify_plan(plan_df: pd.DataFrame, daily_capacity: float, product_col: str = "Product_Number") -> Dict[str, Any]:
     issues: List[Dict[str, Any]] = []
 
     # 1) CAPA 위반 (ERROR)
@@ -137,7 +119,6 @@ def verify_plan(plan_df: pd.DataFrame, daily_capacity: float) -> Dict[str, Any]:
                         if is_cvar else "단일 시나리오/결정론 plan에서 동시양수는 데이터/로직 점검 필요."
             })
 
-    # ok 판정: ERROR만 있으면 false, WARN만 있으면 true
     has_error = any(i.get("severity") == "ERROR" for i in issues)
     return {"ok": (not has_error), "issues": issues}
 
@@ -155,7 +136,6 @@ def suggest_fixes(plan_df: pd.DataFrame, issues: List[Dict[str, Any]]) -> Dict[s
                 "severity": sev,
             })
         elif t == "INV_BACKLOG_BOTH_POS":
-            # CVaR mean plan이면 경고성 안내만
             suggestions.append({
                 "target": "verifier_rule",
                 "action": "treat_as_warn_for_cvar_mean_plan",
@@ -257,9 +237,9 @@ def update_policy_from_outcomes(policy: Dict[str, Any], metrics: Dict[str, Any],
 # =========================================================
 # MC 시나리오 로드/시뮬레이션/검증
 # =========================================================
-def load_mc_scenarios(path: str) -> pd.DataFrame:
+def load_mc_scenarios(path: str, product_col: str = "Product_Number") -> pd.DataFrame:
     df = pd.read_csv(path)
-    required = {"scenario_id", "day_idx", "Product_Number", "demand"}
+    required = {"scenario_id", "day_idx", product_col, "demand"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"MC scenarios missing cols: {missing}")
@@ -267,88 +247,92 @@ def load_mc_scenarios(path: str) -> pd.DataFrame:
     df["scenario_id"] = pd.to_numeric(df["scenario_id"], errors="coerce").fillna(0).astype(int)
     df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
     df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
-    df["Product_Number"] = df["Product_Number"].map(_normalize_product)
+    df[product_col] = df[product_col].map(_normalize_product)
     return df
 
-def _build_product_day_grid(products: List[str], days: List[int]) -> pd.DataFrame:
+def _build_product_day_grid(products: List[str], days: List[int], product_col: str = "Product_Number") -> pd.DataFrame:
     return pd.MultiIndex.from_product(
         [products, days],
-        names=["Product_Number", "day_idx"],
+        names=[product_col, "day_idx"],
     ).to_frame(index=False)
 
 def simulate_fixed_plan(
     plan_df: pd.DataFrame,
     demand_df: pd.DataFrame,
-    initial_inventory: float = 0.0
+    initial_inventory: float = 0.0,
+    product_col: str = "Product_Number",
 ) -> pd.DataFrame:
     """
     고정 생산계획(plan_df)을 특정 시나리오 수요(demand_df) 하에서 시뮬레이션.
 
-    - stock = inv - backlog (net stock)
-    - available = stock + produce
-    - fulfilled = min(max(available,0), demand)
-    - shortage = demand - fulfilled
-    - stock = available - demand (carry)
+    ✅ planner_opt/evaluator 정합: shortage = backlog 증가분 (신규 미충족)
+      - backlog_t = max(-stock_t, 0)
+      - shortage_t = max(backlog_t - backlog_{t-1}, 0), shortage_0 = backlog_0
 
-    ✅ plan/demand에 일부 (product, day)가 빠져도 (products×days) 그리드로 0 채움.
+    plan/demand에 일부 (product, day)가 빠져도 (products×days) 그리드로 0 채움.
     """
-    required_plan = {"Product_Number", "day_idx", "produce"}
-    required_dem  = {"Product_Number", "day_idx", "demand"}
+    required_plan = {product_col, "day_idx", "produce"}
+    required_dem  = {product_col, "day_idx", "demand"}
     if not (required_plan <= set(plan_df.columns)):
         raise ValueError(f"plan_df missing cols: {required_plan - set(plan_df.columns)}")
     if not (required_dem <= set(demand_df.columns)):
         raise ValueError(f"demand_df missing cols: {required_dem - set(demand_df.columns)}")
 
     plan = plan_df.copy()
-    plan["Product_Number"] = plan["Product_Number"].map(_normalize_product)
+    plan[product_col] = plan[product_col].map(_normalize_product)
     plan["day_idx"] = pd.to_numeric(plan["day_idx"], errors="coerce").fillna(0).astype(int)
     plan["produce"] = pd.to_numeric(plan["produce"], errors="coerce").fillna(0.0)
 
     dem = demand_df.copy()
-    dem["Product_Number"] = dem["Product_Number"].map(_normalize_product)
+    dem[product_col] = dem[product_col].map(_normalize_product)
     dem["day_idx"] = pd.to_numeric(dem["day_idx"], errors="coerce").fillna(0).astype(int)
     dem["demand"] = pd.to_numeric(dem["demand"], errors="coerce").fillna(0.0)
 
-    prod_agg = plan.groupby(["Product_Number", "day_idx"], as_index=False)["produce"].sum()
-    dem_agg  = dem.groupby(["Product_Number", "day_idx"], as_index=False)["demand"].sum().rename(columns={"demand": "demand_s"})
+    prod_agg = plan.groupby([product_col, "day_idx"], as_index=False)["produce"].sum()
+    dem_agg  = dem.groupby([product_col, "day_idx"], as_index=False)["demand"].sum().rename(columns={"demand": "demand_s"})
 
-    products = sorted(set(prod_agg["Product_Number"]).union(set(dem_agg["Product_Number"])))
+    products = sorted(set(prod_agg[product_col]).union(set(dem_agg[product_col])))
     if not products:
         return pd.DataFrame(columns=[
-            "Product_Number","day_idx","produce","demand","fulfilled","shortage","end_inventory","backlog"
+            product_col, "day_idx", "produce", "demand", "fulfilled", "shortage", "end_inventory", "backlog"
         ])
 
     days = sorted(set(prod_agg["day_idx"]).union(set(dem_agg["day_idx"])))
     if not days:
         days = [0]
 
-    grid = _build_product_day_grid(products, days)
+    grid = _build_product_day_grid(products, days, product_col=product_col)
 
     sim = (
-        grid.merge(prod_agg, on=["Product_Number", "day_idx"], how="left")
-            .merge(dem_agg,  on=["Product_Number", "day_idx"], how="left")
+        grid.merge(prod_agg, on=[product_col, "day_idx"], how="left")
+            .merge(dem_agg,  on=[product_col, "day_idx"], how="left")
     )
     sim["produce"] = sim["produce"].fillna(0.0)
     sim["demand_s"] = sim["demand_s"].fillna(0.0)
-    sim = sim.sort_values(["Product_Number","day_idx"]).reset_index(drop=True)
+    sim = sim.sort_values([product_col, "day_idx"]).reset_index(drop=True)
 
     out_rows: List[Dict[str, Any]] = []
-    for p, g in sim.groupby("Product_Number", sort=False):
+    for p, g in sim.groupby(product_col, sort=False):
         stock = float(initial_inventory)
+        prev_backlog = 0.0
+
         for _, r in g.iterrows():
             produce = float(r["produce"])
             demand  = float(r["demand_s"])
 
             available = stock + produce
             fulfilled = min(max(available, 0.0), demand)
-            shortage = max(demand - fulfilled, 0.0)
 
             stock = available - demand
             inv = max(stock, 0.0)
             backlog = max(-stock, 0.0)
 
+            # ✅ 신규 미충족 = backlog 증가분
+            shortage = max(backlog - prev_backlog, 0.0)
+            prev_backlog = backlog
+
             out_rows.append({
-                "Product_Number": p,
+                product_col: p,
                 "day_idx": int(r["day_idx"]),
                 "produce": produce,
                 "demand": demand,
@@ -362,10 +346,6 @@ def simulate_fixed_plan(
 
 
 def summarize_mc_results(per_scenario_metrics: pd.DataFrame, alpha: float, fail_threshold: float) -> Dict[str, Any]:
-    """
-    summary 스키마 고정:
-    - metric: mean / VaR / worst (+ Loss는 CVaR)
-    """
     out: Dict[str, Any] = {}
     if per_scenario_metrics.empty:
         return {"alpha": float(alpha), "S": 0, "FailRate": 0.0, "FailThreshold": float(fail_threshold)}
@@ -391,7 +371,6 @@ def summarize_mc_results(per_scenario_metrics: pd.DataFrame, alpha: float, fail_
     out["alpha"] = float(alpha)
     out["S"] = int(per_scenario_metrics["scenario_id"].nunique())
 
-    # 디버깅용(평균 P/D)
     if "P" in per_scenario_metrics.columns and len(per_scenario_metrics["P"]) > 0:
         out["P_mean"] = float(per_scenario_metrics["P"].mean())
     if "D" in per_scenario_metrics.columns and len(per_scenario_metrics["D"]) > 0:
@@ -409,19 +388,23 @@ def mc_validate_plan(
     w_b: float,
     w_i: float,
     fail_threshold: float,
+    product_col: str = "Product_Number",
 ) -> Dict[str, Any]:
     """
     planner_opt CVaR과 1:1 정합 (rate 기반):
     - AvgInventory = sum(end_inventory)/(P*D)
+    - Shortage = backlog 증가분(신규 미충족)
     """
     plan = plan_df.copy()
-    plan["Product_Number"] = plan["Product_Number"].map(_normalize_product)
+    plan = _ensure_cols(plan, [product_col, "day_idx", "produce"], fill=0.0)
+    plan[product_col] = plan[product_col].map(_normalize_product)
     plan["day_idx"] = pd.to_numeric(plan["day_idx"], errors="coerce").fillna(0).astype(int)
     plan["produce"] = pd.to_numeric(plan["produce"], errors="coerce").fillna(0.0)
 
     sc = scenarios_df.copy()
+    sc = _ensure_cols(sc, ["scenario_id", "day_idx", product_col, "demand"], fill=0.0)
     sc["scenario_id"] = pd.to_numeric(sc["scenario_id"], errors="coerce").fillna(0).astype(int)
-    sc["Product_Number"] = sc["Product_Number"].map(_normalize_product)
+    sc[product_col] = sc[product_col].map(_normalize_product)
     sc["day_idx"] = pd.to_numeric(sc["day_idx"], errors="coerce").fillna(0).astype(int)
     sc["demand"] = pd.to_numeric(sc["demand"], errors="coerce").fillna(0.0)
 
@@ -431,15 +414,16 @@ def mc_validate_plan(
     for sid, g in sc.groupby("scenario_id", sort=True):
         sim = simulate_fixed_plan(
             plan_df=plan,
-            demand_df=g[["Product_Number", "day_idx", "demand"]],
+            demand_df=g[[product_col, "day_idx", "demand"]],
             initial_inventory=float(initial_inventory),
+            product_col=product_col,
         )
 
         total_dem = float(sim["demand"].sum())
         total_short = float(sim["shortage"].sum())
         short_rate = float(total_short / (total_dem + _EPS))
 
-        P = int(sim["Product_Number"].nunique()) if not sim.empty else 1
+        P = int(sim[product_col].nunique()) if not sim.empty else 1
         D = int(sim["day_idx"].nunique()) if not sim.empty else 1
 
         avg_inv = float(sim["end_inventory"].sum() / float(max(P * D, 1)))
@@ -475,8 +459,9 @@ def audit_and_learn(
     llm_enabled: bool = False,
     planner_note: str = "",
     reporter_note: str = "",
+    product_col: str = "Product_Number",
 ) -> Dict[str, Any]:
-    ver = verify_plan(plan_df, daily_capacity)
+    ver = verify_plan(plan_df, daily_capacity, product_col=product_col)
     fixes = suggest_fixes(plan_df, ver.get("issues", []))
 
     critique_text = llm_critique(metrics_summary or {}, plan_df.head(200), enabled=llm_enabled)
@@ -508,6 +493,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Planner Evaluator (verify → fixes → policy update)")
     ap.add_argument("--plan_csv", required=True, help="production_plan.csv 경로")
     ap.add_argument("--daily_capacity", type=float, required=True, help="일일 CAPA")
+    ap.add_argument("--product_col", type=str, default="Product_Number", help="제품 컬럼명 (default: Product_Number)")
     ap.add_argument("--metrics_json", type=str, default=None, help="planning_metrics.json 경로(옵션)")
     ap.add_argument("--policy_path", type=str, default=None, help="정책 저장/로드 파일 경로(옵션)")
     ap.add_argument("--llm_enabled", action="store_true", help="LLM 기반 critique/crosscheck 사용")
@@ -527,9 +513,9 @@ if __name__ == "__main__":
 
     # plan 로드 + 숫자 보정
     plan_df = pd.read_csv(args.plan_csv)
-    plan_df = _ensure_cols(plan_df, ["Product_Number", "day_idx", "produce"], fill=0.0)
+    plan_df = _ensure_cols(plan_df, [args.product_col, "day_idx", "produce"], fill=0.0)
 
-    plan_df["Product_Number"] = plan_df["Product_Number"].map(_normalize_product)
+    plan_df[args.product_col] = plan_df[args.product_col].map(_normalize_product)
     plan_df["day_idx"] = pd.to_numeric(plan_df["day_idx"], errors="coerce").fillna(0).astype(int)
     plan_df["produce"] = pd.to_numeric(plan_df["produce"], errors="coerce").fillna(0.0)
 
@@ -540,7 +526,7 @@ if __name__ == "__main__":
     # MC 검증(옵션)
     mc_validation = None
     if args.mc_scenarios_csv:
-        scenarios_df = load_mc_scenarios(args.mc_scenarios_csv)
+        scenarios_df = load_mc_scenarios(args.mc_scenarios_csv, product_col=args.product_col)
         mc_validation = mc_validate_plan(
             plan_df=plan_df,
             scenarios_df=scenarios_df,
@@ -550,6 +536,7 @@ if __name__ == "__main__":
             w_b=float(args.mc_wb),
             w_i=float(args.mc_wi),
             fail_threshold=float(args.mc_fail_threshold),
+            product_col=args.product_col,
         )
 
         mc_out_path = args.mc_out_json
@@ -578,6 +565,7 @@ if __name__ == "__main__":
         metrics_summary=metrics_summary,
         policy_path=args.policy_path,
         llm_enabled=args.llm_enabled,
+        product_col=args.product_col,
     )
 
     if mc_validation is not None:

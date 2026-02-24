@@ -6,31 +6,37 @@ Metrics utilities for SCM pipeline:
 - Planning  metrics: FillRate, ShortageRate, BacklogLevelRate, Utilization, Smoothness, InventoryTurnover
 - Optional cluster-level metrics when feat_df (Product_Number, Cluster) provided
 
-[IMPORTANT UPDATE]
-- Planning BacklogRate/FillRate are computed from "shortage" = backlog increase (new unmet demand),
+[IMPORTANT]
+- Planning FillRate is computed from "shortage" = backlog increase (new unmet demand),
   consistent with planner_opt / evaluator definition:
-    shortage_{t} = max(backlog_t - backlog_{t-1}, 0), shortage_0 = backlog_0
+    shortage_t = max(backlog_t - backlog_{t-1}, 0), shortage_0 = backlog_0
   TotalShortage = sum(shortage)
   ShortageRate  = TotalShortage / TotalDemand
   FillRate      = 1 - ShortageRate
 
-- We still report backlog "level" totals for reference (can be useful, but not for service-rate).
+[이번 수정 핵심]
+1) Forecast metrics wide-form에서 horizons 자동탐지(미지정 시) 지원
+2) Plan 컬럼 표준화 강화: shortage 컬럼이 있으면 backlog 없이도 service 계산 가능
+3) CVaR mean plan(시나리오 평균 plan)에서 FillRate 왜곡 방지:
+   - shortage 컬럼이 있으면 backlog diff로 다시 계산하지 말고 shortage를 우선 사용
+   - shortage 합산은 항상 (product, day) 단위로 집계 후 총합으로 계산
+4) Cluster KPI 계산 안전화
 """
 
 from __future__ import annotations
 from typing import Dict, List, Optional, Tuple
 import json
+import re
 
 import numpy as np
 import pandas as pd
+
+_EPS = 1e-9
 
 
 # ---------------------------
 # Helpers (safe numeric ops)
 # ---------------------------
-
-_EPS = 1e-9
-
 
 def _to_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -127,6 +133,55 @@ def _align_long(
     return m[pred_col].to_numpy(), m[act_col].to_numpy()
 
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def _extract_horizon_index(col: str) -> Optional[int]:
+    c = _norm(col)
+    if re.fullmatch(r"T", c):
+        return 0
+    m = re.fullmatch(r"T\+(\d+)", c)
+    if m:
+        return int(m.group(1))
+    if "T일" in c:
+        return 0
+    m2 = re.search(r"T\+(\d+)\s*일", c)
+    if m2:
+        return int(m2.group(1))
+    m3 = re.search(r"T\+(\d+)", c)
+    if m3:
+        return int(m3.group(1))
+    return None
+
+
+def detect_horizons_from_df(df: pd.DataFrame, product_col: str) -> List[str]:
+    cands: List[str] = []
+    for c in df.columns:
+        if c == product_col:
+            continue
+        cc = _norm(c)
+        if ("예상" in cc or "예정" in cc or "수주" in cc) and (("T일" in cc) or ("T+" in cc)):
+            cands.append(c)
+        elif re.fullmatch(r"T(\+\d+)?", cc):
+            cands.append(c)
+        elif re.search(r"T\+\d+", cc):
+            cands.append(c)
+
+    with_h = []
+    no_h = []
+    for c in cands:
+        h = _extract_horizon_index(c)
+        if h is not None:
+            with_h.append((h, c))
+        else:
+            no_h.append((None, c))
+
+    out = [c for _, c in sorted(with_h, key=lambda x: x[0])] + [c for _, c in no_h]
+    out = list(dict.fromkeys(out))
+    return out
+
+
 def compute_forecast_metrics(
     pred_df: pd.DataFrame,
     actuals_df: pd.DataFrame,
@@ -137,21 +192,28 @@ def compute_forecast_metrics(
         yhat, y = _align_long(pred_df, actuals_df, product_col)
     else:
         if not horizons:
-            raise ValueError("horizons required for wide-vs-wide evaluation")
+            horizons = detect_horizons_from_df(pred_df, product_col=product_col)
+        if not horizons:
+            raise ValueError("horizons required for wide-vs-wide evaluation (auto-detect failed)")
         yhat, y = _align_wide(pred_df, actuals_df, product_col, horizons)
     return _error_metrics(yhat, y)
 
 
 # ---------------------------------------
-# Planning metrics (UPDATED)
+# Planning metrics
 # ---------------------------------------
 
-def _ensure_plan_cols(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    planner_opt 출력이 버전마다 컬럼명이 조금씩 다를 수 있어서,
-    최소 요구 컬럼을 안전하게 맞춰준다.
-    """
+def _ensure_plan_cols(df: pd.DataFrame, product_col: str) -> pd.DataFrame:
     df = df.copy()
+
+    # product col
+    if product_col not in df.columns:
+        for cand in ["Product_Number", "product", "SKU", "품번"]:
+            if cand in df.columns:
+                df[product_col] = df[cand]
+                break
+    if product_col not in df.columns:
+        df[product_col] = "__ALL__"
 
     # day index
     if "day_idx" not in df.columns:
@@ -164,52 +226,53 @@ def _ensure_plan_cols(df: pd.DataFrame) -> pd.DataFrame:
     if "demand" not in df.columns:
         raise KeyError("plan_df missing 'demand'")
     if "produce" not in df.columns:
-        # 가끔 'production'으로 오는 경우
         if "production" in df.columns:
             df["produce"] = df["production"]
         else:
             raise KeyError("plan_df missing 'produce' (or 'production')")
 
-    # backlog
+    # optional columns
     if "backlog" not in df.columns:
-        # shortage만 있는 경우 backlog level이 없을 수 있음
-        # 그 경우 backlog level totals는 0으로 처리
-        df["backlog"] = 0.0
-
-    # inventory
+        df["backlog"] = np.nan  # 없다는 정보를 유지
+    if "shortage" not in df.columns:
+        df["shortage"] = np.nan
     if "end_inventory" not in df.columns:
         if "inventory" in df.columns:
             df["end_inventory"] = df["inventory"]
         elif "inv" in df.columns:
             df["end_inventory"] = df["inv"]
         else:
-            # inventory가 아예 없으면 0으로
             df["end_inventory"] = 0.0
 
     return df
 
 
-def _compute_shortage_from_backlog(
-    df: pd.DataFrame,
-    product_col: str,
-) -> pd.Series:
+def _compute_shortage_from_backlog(df: pd.DataFrame, product_col: str) -> float:
     """
-    shortage = backlog 증가분 (신규 미충족), shortage_0 = backlog_0
-    df는 (product, day_idx) 기준으로 유일해야 가장 깔끔하지만,
-    중복이 있어도 sum으로 묶어서 처리한다.
+    backlog가 있을 때 shortage = backlog 증가분.
+    반환: total_shortage (float)
     """
-    # (product, day) 단위로 backlog 레벨을 하나로 만들기
-    g = (df.groupby([product_col, "day_idx"], dropna=False, as_index=False)["backlog"]
-           .sum(numeric_only=True))
-
-    g = g.sort_values([product_col, "day_idx"])
-    # diff of backlog level per product
+    g = (
+        df.groupby([product_col, "day_idx"], dropna=False, as_index=False)["backlog"]
+          .sum(numeric_only=True)
+          .sort_values([product_col, "day_idx"])
+    )
     g["prev_backlog"] = g.groupby(product_col)["backlog"].shift(1).fillna(0.0)
-    inc = (g["backlog"] - g["prev_backlog"]).clip(lower=0.0)
-    # day0에서 prev_backlog=0이므로 backlog_0이 그대로 shortage로 들어감
-    g["shortage"] = inc
-    # 원래 df index 길이에 맞출 필요는 없고, 총합/집계에 쓸 Series면 충분
-    return g["shortage"]
+    g["shortage"] = (g["backlog"] - g["prev_backlog"]).clip(lower=0.0)
+    return float(g["shortage"].sum())
+
+
+def _compute_shortage_from_shortage_col(df: pd.DataFrame, product_col: str) -> float:
+    """
+    shortage 컬럼이 이미 plan_df에 있을 때(CVaR mean plan 등).
+    (product, day) 중복이 있을 수 있으니 합친 뒤 총합.
+    반환: total_shortage (float)
+    """
+    g = (
+        df.groupby([product_col, "day_idx"], dropna=False, as_index=False)["shortage"]
+          .sum(numeric_only=True)
+    )
+    return float(g["shortage"].sum())
 
 
 def compute_planning_metrics(
@@ -219,29 +282,37 @@ def compute_planning_metrics(
     product_col: str = "Product_Number",
 ) -> Dict[str, object]:
 
-    df = _ensure_plan_cols(plan_df)
+    df = _ensure_plan_cols(plan_df, product_col=product_col)
 
-    # normalize product id ('.0' 제거 등)
-    if product_col in df.columns:
-        df[product_col] = df[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
-    else:
-        # product_col 없으면 shortage는 day-level로만 계산(제한적)
-        # 그래도 파이프라인은 안 죽게 처리
-        df[product_col] = "__ALL__"
-
-    # numeric
-    for c in ["demand", "produce", "backlog", "end_inventory"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    # normalize ids
+    df[product_col] = df[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
     df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
 
-    # totals
+    # numeric
+    for c in ["demand", "produce", "backlog", "shortage", "end_inventory"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    df["demand"] = df["demand"].fillna(0.0)
+    df["produce"] = df["produce"].fillna(0.0)
+    df["end_inventory"] = df["end_inventory"].fillna(0.0)
+
+    # backlog/shortage는 없을 수도 있으므로 그대로 둠(na 유지)
     total_demand = float(df["demand"].sum())
     total_produce = float(df["produce"].sum())
-    backlog_level_total = float(df["backlog"].sum())  # (참고용, 레벨 합이라 과대해질 수 있음)
 
-    # shortage-based service metrics (✅ evaluator와 정합)
-    shortage = _compute_shortage_from_backlog(df, product_col=product_col)
-    total_shortage = float(shortage.sum())
+    # reference only (level-based)
+    backlog_level_total = float(df["backlog"].fillna(0.0).sum())
+
+    # ✅ service metrics
+    if df["shortage"].notna().any():
+        total_shortage = _compute_shortage_from_shortage_col(df.fillna({"shortage": 0.0}), product_col=product_col)
+    else:
+        if df["backlog"].notna().any():
+            total_shortage = _compute_shortage_from_backlog(df.fillna({"backlog": 0.0}), product_col=product_col)
+        else:
+            # shortage도 backlog도 없으면 service를 계산할 근거가 없음 → 0으로 두되 표시
+            total_shortage = 0.0
+
     shortage_rate = float(total_shortage / (total_demand + _EPS))
     fill_rate = float(1.0 - shortage_rate)
 
@@ -256,39 +327,33 @@ def compute_planning_metrics(
     inv_turn = float(total_produce / (inv_mean + _EPS))
 
     out: Dict[str, object] = {
-        # --- service (shortage-based)
         "FillRate": fill_rate,
         "ShortageRate": shortage_rate,
         "TotalShortage": total_shortage,
 
-        # --- reference only (level-based; NOT for service evaluation)
         "BacklogLevelTotal": backlog_level_total,
         "BacklogLevelRate": float(backlog_level_total / (total_demand + _EPS)),
 
-        # --- capacity / stability
         "Utilization_mean": util_mean,
         "Utilization_total": util_total,
         "Smoothness": smoothness,
 
-        # --- inventory
         "AvgInventory": inv_mean,
         "InventoryTurnover": inv_turn,
 
-        # --- totals
         "TotalDemand": total_demand,
         "TotalProduction": total_produce,
         "n_days": n_days,
     }
 
-    # optional: per-day utilization series (debugging/plots)
     try:
         out["DailyUtilization"] = (daily_prod / (daily_capacity + _EPS)).round(6).to_dict()
     except Exception:
         pass
 
-    # cluster-level backlog/shortage (safe merge)
-    if feat_df is not None:
-        if {"Cluster", product_col}.issubset(feat_df.columns):
+    # cluster-level KPI
+    if feat_df is not None and isinstance(feat_df, pd.DataFrame):
+        if {product_col, "Cluster"}.issubset(feat_df.columns):
             feat = feat_df[[product_col, "Cluster"]].copy()
             feat[product_col] = feat[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
             feat = feat.drop_duplicates(subset=[product_col], keep="first")
@@ -299,27 +364,35 @@ def compute_planning_metrics(
             m["Cluster"] = m["Cluster"].astype(int)
 
             if not m.empty:
-                # cluster totals (demand, backlog level)
                 grp = m.groupby("Cluster")[["demand", "backlog"]].sum(numeric_only=True)
-                grp["backlog_level_rate"] = grp["backlog"] / (grp["demand"] + _EPS)
+                grp["backlog_level_rate"] = grp["backlog"].fillna(0.0) / (grp["demand"] + _EPS)
 
-                # cluster shortage rate (by product within cluster)
-                # compute shortage on (Cluster, Product, day)
-                g2 = (m.groupby(["Cluster", product_col, "day_idx"], as_index=False)["backlog"].sum())
-                g2 = g2.sort_values(["Cluster", product_col, "day_idx"])
-                g2["prev"] = g2.groupby(["Cluster", product_col])["backlog"].shift(1).fillna(0.0)
-                g2["shortage"] = (g2["backlog"] - g2["prev"]).clip(lower=0.0)
+                # cluster shortage totals
+                if m["shortage"].notna().any():
+                    sh = (
+                        m.fillna({"shortage": 0.0})
+                         .groupby("Cluster")["shortage"].sum(numeric_only=True)
+                    )
+                else:
+                    # backlog diff within cluster/product
+                    g2 = (
+                        m.fillna({"backlog": 0.0})
+                         .groupby(["Cluster", product_col, "day_idx"], as_index=False)["backlog"].sum()
+                         .sort_values(["Cluster", product_col, "day_idx"])
+                    )
+                    g2["prev"] = g2.groupby(["Cluster", product_col])["backlog"].shift(1).fillna(0.0)
+                    g2["shortage"] = (g2["backlog"] - g2["prev"]).clip(lower=0.0)
+                    sh = g2.groupby("Cluster")["shortage"].sum(numeric_only=True)
 
-                dem2 = m.groupby("Cluster")["demand"].sum()
-                sh2 = g2.groupby("Cluster")["shortage"].sum()
-                cluster_short_rate = (sh2 / (dem2 + _EPS)).replace([np.inf, -np.inf], np.nan)
+                dem = m.groupby("Cluster")["demand"].sum(numeric_only=True)
+                cluster_short_rate = (sh / (dem + _EPS)).replace([np.inf, -np.inf], np.nan)
 
                 out["ClusterKPI"] = {
                     int(k): {
                         "demand": float(grp.loc[k, "demand"]),
-                        "backlog_level": float(grp.loc[k, "backlog"]),
+                        "backlog_level": float(grp.loc[k, "backlog"]) if "backlog" in grp.columns else 0.0,
                         "backlog_level_rate": float(grp.loc[k, "backlog_level_rate"]),
-                        "total_shortage": float(sh2.get(k, 0.0)),
+                        "total_shortage": float(sh.get(k, 0.0)),
                         "shortage_rate": float(cluster_short_rate.get(k, np.nan)),
                     }
                     for k in grp.index.tolist()
@@ -344,7 +417,6 @@ if __name__ == "__main__":
     parser.add_argument("--daily_capacity", type=float, default=10000)
     parser.add_argument("--out_json", type=str, default=None)
 
-    # ✅ compatibility: when only planning metrics are computed, write "Planning" block only
     parser.add_argument(
         "--flat_planning",
         action="store_true",
@@ -357,16 +429,12 @@ if __name__ == "__main__":
     if args.pred_csv and args.actuals_csv:
         pred = pd.read_csv(args.pred_csv)
         act = pd.read_csv(args.actuals_csv)
-        results["Forecast"] = compute_forecast_metrics(
-            pred, act, args.horizons, args.product_col
-        )
+        results["Forecast"] = compute_forecast_metrics(pred, act, args.horizons, args.product_col)
 
     if args.plan_csv:
         plan = pd.read_csv(args.plan_csv)
         feat = pd.read_csv(args.feat_csv) if args.feat_csv else None
-        results["Planning"] = compute_planning_metrics(
-            plan, args.daily_capacity, feat_df=feat, product_col=args.product_col
-        )
+        results["Planning"] = compute_planning_metrics(plan, args.daily_capacity, feat_df=feat, product_col=args.product_col)
 
     for sec, metrics in results.items():
         print(f"\n[{sec} metrics]")
