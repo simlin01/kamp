@@ -10,6 +10,15 @@ main.py — End-to-end SCM planning pipeline (ONE-SHOT)
 - target column 키워드: "예상/예정" 모두 허용
 - (중요) evaluator/product_col 정합: prod_col 변경 시에도 MC 검증이 깨지지 않도록 전달
 - (중요) snapshot_latest_by_product 시그니처(value_cols) 반영
+
+[추가 개선(반영)]
+- ✅ CVaR 최적화용 30개 시나리오 샘플링을 "tail(리스크) 중심"으로 변경
+  기존: total_demand 분위수만 커버 → worst-loss 시나리오가 30개에 누락될 수 있음
+  개선: proxy_shortage(=max(total_demand - capacity*D,0)) 기반 tail 포함 + 분위수 커버 혼합
+
+[안전성 수정(필수)]
+- ✅ PO.preprocess_forecast / PO.load_cluster_info 에 prod_col 전달
+- ✅ MC 요약 alpha(mc_alpha)와 planner CVaR alpha(cvar_alpha) 분리 가능
 """
 
 from __future__ import annotations
@@ -99,12 +108,13 @@ def _run_forecast_python_api(
 ):
     df = pd.read_csv(feat_csv)
 
-    # ✅ "예상/예정" 모두 허용 (데이터 컬럼명 불일치 방지)
+    # ✅ "예상/예정" 모두 허용
     target_cols = FO.find_target_cols(df, ["예상 수주량", "예정 수주량"])
     if not target_cols:
         raise RuntimeError("Target columns not found in feat.csv. (예상/예정 수주량 컬럼 확인 필요)")
 
     dt_use = dt_col or (FO.DEFAULT_DT_COL if hasattr(FO, "DEFAULT_DT_COL") else "DateTime")
+
     X, y, num_cols, cat_cols, _excluded = FO.build_xy(df, prod_col, target_cols, log_target)
     bp = FO.load_best_params(best_params_path) or {}
 
@@ -171,7 +181,7 @@ def _run_forecast_python_api(
     pred_all.to_csv(out_pred_csv, index=False, encoding="utf-8-sig")
     metrics_df.to_csv(out_metrics_csv, encoding="utf-8-sig")
 
-    # ✅ 핵심 수정: 제품단(plan 입력)은 "최신 스냅샷"으로 통일 + value_cols 전달
+    # ✅ 제품단(plan 입력)은 "최신 스냅샷" + value_cols 전달
     if hasattr(FO, "snapshot_latest_by_product"):
         prod_snap = FO.snapshot_latest_by_product(
             pred_all,
@@ -194,6 +204,62 @@ def _run_forecast_python_api(
 
 
 # =========================================================
+# Tail-focused scenario sampling (NEW)
+# =========================================================
+def _sample_scenarios_for_optimization(
+    scenarios_re: np.ndarray,
+    daily_capacity: float,
+    n_sample: int = 30,
+    tail_frac: float = 0.4,
+    seed: int = 2025,
+) -> np.ndarray:
+    """
+    scenarios_re: (S,P,D)
+
+    목표: CVaR 최적화에 "tail(서비스 리스크)"를 반드시 포함
+    - proxy_shortage = max(total_demand - daily_capacity*D, 0)
+    - 구성: tail(상위) 일부 + 분위수 커버 일부 + 랜덤 소량(다양성)
+    """
+    rng = np.random.default_rng(int(seed))
+    S = scenarios_re.shape[0]
+    if S <= n_sample:
+        return scenarios_re
+
+    D = scenarios_re.shape[2]
+    total_demands = scenarios_re.sum(axis=(1, 2))  # (S,)
+    cap_total = float(daily_capacity) * float(D)
+    proxy_short = np.maximum(total_demands - cap_total, 0.0)  # (S,)
+
+    # 1) tail: proxy_short 상위 tail_frac
+    tail_k = int(max(1, round(n_sample * float(tail_frac))))
+    tail_idx = np.argsort(proxy_short)[-tail_k:]  # 큰 값 tail
+
+    # 2) quantile cover: total_demand 분위수로 균일 샘플
+    remain = n_sample - tail_k
+    if remain > 0:
+        sorted_idx = np.argsort(total_demands)
+        q_idx = sorted_idx[np.linspace(0, S - 1, remain, dtype=int)]
+    else:
+        q_idx = np.array([], dtype=int)
+
+    # 3) union + 부족분 랜덤 보충 (중복 제거)
+    picked = np.unique(np.concatenate([tail_idx, q_idx], axis=0))
+    if picked.size < n_sample:
+        rest = np.setdiff1d(np.arange(S), picked, assume_unique=False)
+        if rest.size > 0:
+            add = rng.choice(rest, size=min(n_sample - picked.size, rest.size), replace=False)
+            picked = np.unique(np.concatenate([picked, add], axis=0))
+
+    # 4) 초과 시 proxy_short 기준으로 상위 n_sample로 컷
+    if picked.size > n_sample:
+        sub = picked
+        sub_sorted = sub[np.argsort(proxy_short[sub])]
+        picked = sub_sorted[-n_sample:]
+
+    return scenarios_re[picked]
+
+
+# =========================================================
 # Pipeline
 # =========================================================
 def run_pipeline(
@@ -210,7 +276,8 @@ def run_pipeline(
     skip_llm: bool = False,
     best_params_path: str = "./configs/best_params.json",
     mc_scenarios: int = 0,
-    mc_alpha: float = 0.9,
+    mc_alpha: float = 0.9,          # MC 요약 VaR 분위수
+    cvar_alpha: float | None = None, # planner CVaR alpha (None이면 mc_alpha 사용)
     mc_seed: int = 2025,
     mc_wb: float = 1.0,
     mc_wi: float = 0.2,
@@ -227,6 +294,9 @@ def run_pipeline(
     planner_seed: int = 42,
     min_lot_map_json: str | None = None,
 ):
+    if cvar_alpha is None:
+        cvar_alpha = mc_alpha
+
     ensure_dir(out_dir)
     reports_dir = os.path.join(out_dir, "reports")
     ensure_dir(reports_dir)
@@ -242,7 +312,7 @@ def run_pipeline(
     audit_json = os.path.join(out_dir, "governance_audit.json")
     mc_validation_json = os.path.join(out_dir, "mc_validation.json")
 
-    # ✅ 버그 방지: MC 미사용 시에도 참조될 수 있으니 기본값 선언
+    # ✅ 버그 방지
     mc_validation = None
 
     # ---------- 1) Features ----------
@@ -267,10 +337,13 @@ def run_pipeline(
     # ---------- 2.5) MC scenarios (Full S) ----------
     if mc_scenarios and mc_scenarios > 0:
         print(f"[2.5/6] Generating MC demand scenarios (S={mc_scenarios}) ...")
-        pred_snap = PO.preprocess_forecast(pred_all.copy())
+        pred_snap = PO.preprocess_forecast(pred_all.copy(), prod_col=prod_col)
         horizons = PO.detect_horizons(pred_snap)
-        res_snap = PO.preprocess_forecast(residual_df_val.copy())
 
+        res_snap = PO.preprocess_forecast(residual_df_val.copy(), prod_col=prod_col)
+        # residual_df_val은 keep_cols=[prod_col, dt_use] + target_cols 이므로 horizons=target_cols로 일치하는 게 정상.
+        # 다만 horizon 자동 감지 실패할 수 있으니, pred쪽 horizons를 그대로 쓰는 구조가 가장 안전.
+        # res_snap에도 동일 horizon 컬럼이 있다고 가정(정합성 목적).
         d_hat = pred_snap[horizons].to_numpy(dtype=float)
         res_pool = res_snap[horizons].to_numpy(dtype=float)
 
@@ -280,8 +353,8 @@ def run_pipeline(
             n_scenarios=int(mc_scenarios),
             seed=int(mc_seed),
         )
-        prod_list = pred_snap[prod_col].astype(str).tolist()
 
+        prod_list = pred_snap[prod_col].astype(str).tolist()
         rows = []
         S, P, D = scenarios.shape
         for s in range(S):
@@ -301,19 +374,24 @@ def run_pipeline(
     else:
         print("[2.5/6] MC scenarios disabled")
 
-    # ---------- 3) Planner (Sampled 30 for optimization, if CVaR) ----------
+    # ---------- 3) Planner ----------
     print("[3/6] Planning (CP-SAT) ...")
-    cluster_info = PO.load_cluster_info(feat_csv)
+    cluster_info = PO.load_cluster_info(feat_csv, prod_col=prod_col)
 
     pred_df = pd.read_csv(forecast_by_product_csv)
-    pred_df = PO.preprocess_forecast(pred_df)
+    pred_df = PO.preprocess_forecast(pred_df, prod_col=prod_col)
     horizons = PO.detect_horizons(pred_df)
 
     min_lot_map = _as_int_key_float_map(_load_json_map_or_none(min_lot_map_json))
 
     hint_plan = None
     if hint_plan_csv and os.path.exists(hint_plan_csv):
-        hint_plan = PO.load_hint_plan_csv(hint_plan_csv, scale=scale)
+        # planner_opt.load_hint_plan_csv에 prod_col 인자 있는 버전이면 아래처럼 호출 가능:
+        try:
+            hint_plan = PO.load_hint_plan_csv(hint_plan_csv, scale=scale, prod_col=prod_col)
+        except TypeError:
+            # 구버전 호환
+            hint_plan = PO.load_hint_plan_csv(hint_plan_csv, scale=scale)
 
     scenarios_for_opt = None
     if use_cvar_planner:
@@ -333,13 +411,16 @@ def run_pipeline(
         forecast_products = pred_df[prod_col].tolist()
         scenarios_re = PO.reorder_mc_scenarios_to_forecast(scenarios, mc_products, forecast_products)
 
-        # ✅ 핵심: 최적화용 30개 시나리오 샘플링 (총수요 분위수 커버)
+        # ✅ 핵심: 최적화용 30개 시나리오 샘플링을 "tail 중심"으로 변경
         if scenarios_re.shape[0] > 30:
-            print(f"  -> Sampling 30 scenarios from {scenarios_re.shape[0]} for optimization...")
-            total_demands = scenarios_re.sum(axis=(1, 2))
-            sorted_idx = np.argsort(total_demands)
-            sample_idx = sorted_idx[np.linspace(0, len(sorted_idx) - 1, 30).astype(int)]
-            scenarios_for_opt = scenarios_re[sample_idx]
+            print(f"  -> Sampling 30 scenarios from {scenarios_re.shape[0]} for optimization (TAIL-AWARE)...")
+            scenarios_for_opt = _sample_scenarios_for_optimization(
+                scenarios_re=scenarios_re,
+                daily_capacity=float(daily_capacity),
+                n_sample=30,
+                tail_frac=0.4,
+                seed=int(mc_seed),
+            )
         else:
             scenarios_for_opt = scenarios_re
 
@@ -357,7 +438,7 @@ def run_pipeline(
         hint_plan=hint_plan,
         use_cvar_obj=use_cvar_planner,
         mc_scenarios=scenarios_for_opt,
-        cvar_alpha=float(mc_alpha),
+        cvar_alpha=float(cvar_alpha),
         lambda_cvar=float(lambda_cvar),
         lambda_scale=int(lambda_scale),
         mc_wb=float(mc_wb),
@@ -375,6 +456,7 @@ def run_pipeline(
             plan_df[c] = pd.to_numeric(plan_df[c], errors="coerce")
     if prod_col in plan_df.columns:
         plan_df[prod_col] = plan_df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+
     plan_df.to_csv(plan_csv, index=False, encoding="utf-8-sig")
 
     # ---------- 3.5) MC validation (Full S) ----------
@@ -440,20 +522,28 @@ def parse_args():
     p.add_argument("--out_dir", default="./outputs")
     p.add_argument("--prod_col", default="Product_Number")
     p.add_argument("--dt_col", default=None)
+
     p.add_argument("--daily_capacity", type=int, default=10000)
     p.add_argument("--lambda_smooth", type=float, default=1.0)
     p.add_argument("--initial_inventory", type=float, default=0.0)
     p.add_argument("--int_production", action="store_true")
+
     p.add_argument("--model", default="gpt-4o-mini")
     p.add_argument("--policy_path", default=None)
     p.add_argument("--skip_llm", action="store_true")
+
     p.add_argument("--best_params_path", default="./configs/best_params.json")
+
+    # MC / CVaR
     p.add_argument("--mc_scenarios", type=int, default=0)
-    p.add_argument("--mc_alpha", type=float, default=0.9)
+    p.add_argument("--mc_alpha", type=float, default=0.9)     # MC 검증 VaR 분위수
+    p.add_argument("--cvar_alpha", type=float, default=None)  # planner CVaR alpha (None이면 mc_alpha 사용)
     p.add_argument("--mc_seed", type=int, default=2025)
     p.add_argument("--mc_wb", type=float, default=1.0)
     p.add_argument("--mc_wi", type=float, default=0.2)
     p.add_argument("--fail_threshold", type=float, default=0.55)
+
+    # planner
     p.add_argument("--scale", type=int, default=10)
     p.add_argument("--use_cvar_planner", action="store_true")
     p.add_argument("--hint_plan_csv", default=None)
@@ -465,6 +555,7 @@ def parse_args():
     p.add_argument("--planner_workers", type=int, default=8)
     p.add_argument("--planner_seed", type=int, default=42)
     p.add_argument("--min_lot_map", type=str, default=None)
+
     return p.parse_args()
 
 
@@ -485,6 +576,7 @@ if __name__ == "__main__":
         best_params_path=args.best_params_path,
         mc_scenarios=args.mc_scenarios,
         mc_alpha=args.mc_alpha,
+        cvar_alpha=args.cvar_alpha,
         mc_seed=args.mc_seed,
         mc_wb=args.mc_wb,
         mc_wi=args.mc_wi,

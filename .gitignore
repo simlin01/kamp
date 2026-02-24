@@ -35,3 +35,13 @@ logs/
 
 # experiment outputs
 outputs_experiment_S30/
+
+# generated outputs / reports
+outputs*/
+*_report_*.html
+*_report_*.md
+*_validation*.json
+*metrics*.json
+governance_audit.json
+mc_validation.json
+planning_metrics.json
