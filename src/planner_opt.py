@@ -4,19 +4,20 @@
 """
 planner_opt.py — CP-SAT 생산계획 (CVaR objective)
 
-[핵심 수정]
-1) ✅ detect_horizons()를 한국어 컬럼에서도 "항상" 올바른 순서로 정렬
-   - _sort_horizons_kor()를 실제로 적용 (기존: 정의만 있고 미사용)
-   - "T일 예상/예정 수주량", "T+3일 ..." 같은 케이스에서 day_idx 축 꼬임 방지
-2) ✅ preprocess_forecast()를 prod_col 인자로 받아 main/forecast와 컬럼명 통일
-   - (기존: Product_Number 고정)
-3) ✅ load_cluster_info()도 prod_col 인자화 + 결측 클러스터 안전 처리
-4) ✅ detect_horizons 후보 수집 로직을 정규식 기반으로 단순/강건화
-   - "T", "T+3" 같은 축약 컬럼
-   - "T일 예상 수주량", "T+3일 예정 수주량" 같은 한국어 풀네임 컬럼
-   - 기타 "T+3 ..." 부분 문자열 포함 컬럼
+[이번 수정의 핵심]
+✅ horizon(타깃) 오염 차단을 planner 쪽에서도 "확실히" 한다
+- forecast.py에서 이미 '작년/전년/지난해' 타깃 제외를 넣었지만,
+  planner_opt.detect_horizons()도 동일하게 방어해야 end-to-end에서 절대 안 섞임.
+- 특히 pred_final_by_product.csv에는 '작년 T+... 예정 수주량' 같은 컬럼이 섞일 수 있으니,
+  detect_horizons에서 과거 참조(PAST_MARKERS)는 후보에서 제거.
 
-※ 최적화 모델(CVaR 정의/로직)은 사용자가 주신 버전을 유지(정합성 목적).
+✅ horizon 정렬은 한국어/축약형 모두 안정적으로 day_idx=0..D-1 정렬
+- _sort_horizons_kor()를 항상 적용
+
+✅ prod_col / dt_col 정합성 유지
+- preprocess_forecast, load_cluster_info, load_hint_plan_csv, load_mc_scenarios 등 prod_col 인자 유지
+
+※ 최적화 모델(CVaR 정의/로직)은 사용자가 주신 버전을 그대로 유지(정합성 목적).
 """
 
 from __future__ import annotations
@@ -35,6 +36,8 @@ from ortools.sat.python import cp_model
 # =========================================================
 
 WEIRD_SPACES = ["\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"]
+PAST_MARKERS = ["작년", "전년", "지난해"]  # ✅ horizon 후보에서 제외해야 하는 과거 참조
+
 
 def _normalize_col(c: str) -> str:
     c2 = unicodedata.normalize("NFKC", str(c))
@@ -44,14 +47,24 @@ def _normalize_col(c: str) -> str:
     return c2
 
 
+def _is_past_ref(col: str) -> bool:
+    cc = _normalize_col(col)
+    return any(m in cc for m in PAST_MARKERS)
+
+
 def _sort_horizons_kor(hs: List[str]) -> List[str]:
     """
     한국어 horizon 컬럼까지 안정 정렬:
     - "T일 ..." -> 0
     - "T+1일 ..." -> 1
     - 축약형 "T" -> 0, "T+3" -> 3
+
+    ✅ 같은 horizon에 '예상'과 '예정'이 함께 있을 수 있는데,
+       planner는 보통 D=forecast horizon(0..4)만 쓰는 게 바람직.
+       정렬 자체는 day_idx만 보장하고, 어떤 컬럼을 쓸지는 main에서 필터링하는 것이 가장 안전.
+       (그래도 일단 예상→예정 순서를 주고 싶다면 아래 priority를 추가할 수 있음)
     """
-    def key(h: str) -> int:
+    def horizon_key(h: str) -> int:
         s = _normalize_col(h)
 
         # 축약형
@@ -75,9 +88,18 @@ def _sort_horizons_kor(hs: List[str]) -> List[str]:
 
         return 10_000
 
+    def within_key(h: str) -> int:
+        # 같은 day_idx 내 '예상' 먼저, '예정' 다음 (선호)
+        s = _normalize_col(h)
+        if "예상" in s:
+            return 0
+        if "예정" in s:
+            return 1
+        return 9
+
     # 중복 제거 + 안정 정렬
     hs_u = list(dict.fromkeys(hs))
-    return sorted(hs_u, key=key)
+    return sorted(hs_u, key=lambda x: (horizon_key(x), within_key(x), _normalize_col(x)))
 
 
 def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_col: str = "DateTime") -> pd.DataFrame:
@@ -136,13 +158,14 @@ def load_cluster_info(feat_file: str, prod_col: str = "Product_Number") -> Dict[
     m["Cluster"] = pd.to_numeric(m["Cluster"], errors="coerce").fillna(1).astype(int)
     return m.set_index(prod_col)["Cluster"].to_dict()
 
+
 # =========================================================
 # (A-1) Warm-start Hint loader
 # =========================================================
 
 def load_hint_plan_csv(path: str, scale: int = 10, prod_col: str = "Product_Number") -> Dict[Tuple[str, int], int]:
     """
-    hint plan CSV -> {(Product_Number, day_idx): produce_int_scaled}
+    hint plan CSV -> {(prod_col, day_idx): produce_int_scaled}
     """
     df = pd.read_csv(path)
     need = {prod_col, "day_idx", "produce"}
@@ -162,6 +185,7 @@ def load_hint_plan_csv(path: str, scale: int = 10, prod_col: str = "Product_Numb
             v = 0
         m[(p, d)] = v
     return m
+
 
 # =========================================================
 # (A-2) MC loader (raw scenarios)
@@ -243,12 +267,24 @@ def detect_horizons(df: pd.DataFrame) -> List[str]:
     """
     horizon 컬럼 후보를 강건하게 수집하고,
     ✅ 반드시 _sort_horizons_kor()로 정렬해서 반환.
+
+    ✅ 추가 방어(중요):
+    - '작년/전년/지난해' 포함 컬럼은 horizon 후보에서 제외
+      (forecast 쪽에서 이미 제외해도, planner에서 한번 더 방어해야 E2E에서 안전)
     """
     candidates: List[str] = []
+
+    def _ok(c: str) -> bool:
+        cc = _normalize_col(c)
+        if _is_past_ref(cc):        # ✅ 과거 참조는 horizon 후보에서 제외
+            return False
+        return True
 
     # 1) 축약형: "T", "T+1" ...
     for c in df.columns:
         cc = _normalize_col(c)
+        if not _ok(c):
+            continue
         if re.fullmatch(r"T(\+\d+)?", cc):
             candidates.append(c)
 
@@ -256,12 +292,16 @@ def detect_horizons(df: pd.DataFrame) -> List[str]:
     rgx_full = re.compile(r"^T(\+\d+)?일\s*(예상|예정)?\s*.*$")  # 예상/예정 없어도 허용
     for c in df.columns:
         cc = _normalize_col(c)
+        if not _ok(c):
+            continue
         if rgx_full.match(cc) and ("수주" in cc or "예상" in cc or "예정" in cc):
             candidates.append(c)
 
     # 3) 마지막 fallback: "T+숫자"가 포함된 컬럼
     for c in df.columns:
         cc = _normalize_col(c)
+        if not _ok(c):
+            continue
         if re.search(r"T\+\d+", cc):
             candidates.append(c)
 
@@ -271,6 +311,7 @@ def detect_horizons(df: pd.DataFrame) -> List[str]:
         raise ValueError("horizons 자동 감지 실패. --horizons 로 명시해 주세요.")
     return candidates
 
+
 # =========================================================
 # (B) CP-SAT var helpers
 # =========================================================
@@ -278,17 +319,21 @@ def detect_horizons(df: pd.DataFrame) -> List[str]:
 def _make_2d_int(model: cp_model.CpModel, P: int, D: int, lb: int, ub: int, name: str):
     return [[model.NewIntVar(lb, ub, f"{name}_{i}_{d}") for d in range(D)] for i in range(P)]
 
+
 def _make_3d_int(model: cp_model.CpModel, S: int, P: int, D: int, lb: int, ub: int, name: str):
     return [[[model.NewIntVar(lb, ub, f"{name}_{s}_{i}_{d}") for d in range(D)] for i in range(P)] for s in range(S)]
 
+
 def _make_2d_bool(model: cp_model.CpModel, P: int, D: int, name: str):
     return [[model.NewBoolVar(f"{name}_{i}_{d}") for d in range(D)] for i in range(P)]
+
 
 # =========================================================
 # (C) Optimization
 # =========================================================
 
 _INT64_MAX = 9_000_000_000_000_000_000  # 9e18 safety
+
 
 def _make_solver(
     solver_seed: int,
@@ -305,8 +350,10 @@ def _make_solver(
     solver.parameters.random_seed = int(solver_seed)
     return solver
 
+
 def _safe_int_cap(x: int, cap: int = 5_000_000_000) -> int:
     return int(min(max(int(x), 1), int(cap)))
+
 
 def optimize_plan(
     forecast_by_product: pd.DataFrame,
@@ -374,10 +421,7 @@ def optimize_plan(
                 key = (p, d)
                 if key in hint_plan:
                     v = int(hint_plan[key])
-                    if v < 0:
-                        v = 0
-                    if v > PROD_UB:
-                        v = PROD_UB
+                    v = max(0, min(v, PROD_UB))
                     model.AddHint(produce[i][d], v)
                     model.AddHint(is_prod[i][d], 1 if v > 0 else 0)
 
@@ -403,7 +447,6 @@ def optimize_plan(
         cum_dem = np.cumsum(demand_i, axis=1)  # (P,D)
         STATE_UB = _safe_int_cap(int(cum_dem.max() * 2))
 
-        # stock 기반(음수 허용)
         stock   = _make_2d_int(model, P, D, -STATE_UB, STATE_UB, "stock")
         inv     = _make_2d_int(model, P, D, 0, STATE_UB, "inv")
         backlog = _make_2d_int(model, P, D, 0, STATE_UB, "backlog")
@@ -437,7 +480,7 @@ def optimize_plan(
             for d in range(D):
                 terms.append(w * backlog[i][d])
 
-        smooth_w = int(round(lambda_smooth * 100))  # 통일: *100
+        smooth_w = int(round(lambda_smooth * 100))
         if smooth_w > 0:
             for i in range(P):
                 for d in range(1, D):
@@ -610,7 +653,7 @@ def optimize_plan(
 
     # ---- smooth penalty ----
     base_terms = []
-    smooth_w = int(round(lambda_smooth * 100))  # 통일: *100
+    smooth_w = int(round(lambda_smooth * 100))
     if smooth_w > 0:
         for i in range(P):
             for d in range(1, D):
@@ -679,6 +722,7 @@ def optimize_plan(
     print("[CVaR]", diag)
     return plan_df, diag
 
+
 # =========================================================
 # (D) CLI
 # =========================================================
@@ -692,6 +736,7 @@ def _load_map_json_or_file(s: Optional[str]) -> Optional[Dict[int, float]]:
     else:
         data = json.loads(s)
     return {int(k): float(v) for k, v in data.items()}
+
 
 def _run_optimize_with_fallbacks(
     *,
@@ -755,6 +800,7 @@ def _run_optimize_with_fallbacks(
 
     raise RuntimeError(last_err or "All fallback attempts failed.")
 
+
 def main():
     ap = argparse.ArgumentParser(description="CP-SAT 생산계획 (CVaR objective + fallback 포함)")
 
@@ -778,7 +824,7 @@ def main():
     ap.add_argument("--initial_inventory_map", type=str, default=None)
 
     # Warm-start
-    ap.add_argument("--hint_plan_csv", type=str, default=None, help="Warm-start hint plan CSV (Product_Number, day_idx, produce)")
+    ap.add_argument("--hint_plan_csv", type=str, default=None, help="Warm-start hint plan CSV (prod_col, day_idx, produce)")
 
     ap.add_argument("--solver_seed", type=int, default=42)
     ap.add_argument("--max_time", type=float, default=300.0)
@@ -865,6 +911,7 @@ def main():
     plan_df.to_csv(args.out_csv, index=False, float_format="%.2f")
     print(f"[OK] Saved plan: {args.out_csv} (rows={len(plan_df)})")
     print("[CVaR diag]", diag)
+
 
 if __name__ == "__main__":
     main()

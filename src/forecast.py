@@ -4,22 +4,13 @@
 """
 forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
 
-[핵심 수정(정합성/안정성)]
-1) ✅ Target 탐지 통일: "예상/예정 수주량" 모두 지원 + horizon 정렬 강건화
-   - utils.py의 규칙과 동일한 정규식 기반 파싱으로 통일
-
-2) ✅ Leakage 방지 규칙 보강:
-   - is_future_plan / is_any_prediction 에서 "예정/예상" 모두 제외
-   - 작년/전년/지난해는 예외 처리 유지
-
-3) ✅ planner 입력(pred_final_by_product.csv)과 MC 기준(d_hat)의 "시점 기준"을 일치
-   - snapshot_latest_by_product()를 기본으로 사용
-   - aggregate_by_product()는 참고용 유지
-
-4) ✅ MC 시나리오: horizon 상관 보존(벡터 resample) + 평균 바이어스 완화(센터링)
-   - residual clip 후 horizon별 평균 0으로 center
-
-(그 외 로직/CLI/파일 포맷은 최대한 그대로 유지)
+[핵심 목표]
+- ✅ Target(horizon) 탐지를 "예상/예정 수주량" 모두 지원하면서도,
+  '작년/전년/지난해' 같은 과거 참조 컬럼이 타깃/호라이즌으로 섞이는 문제를 확실히 차단
+- ✅ Leakage 방지 규칙 보강: feature 선택 시 "예상/예정 수주량"은 미래정보로 간주하여 제외
+  (단, 작년/전년/지난해는 과거라서 제외하지 않음)
+- ✅ planner 입력(pred_final_by_product.csv)과 MC 기준(d_hat)의 시점 기준을 최신 스냅샷으로 통일
+- ✅ MC 시나리오: 잔차 벡터(resample)로 horizon 상관 보존 + mean-centering(바이어스 완화)
 """
 
 from __future__ import annotations
@@ -56,11 +47,15 @@ try:
 except Exception:
     optuna = None
 
+
 DEFAULT_PROD_COL = "Product_Number"
 DEFAULT_DT_COL   = "DateTime"
 
 # ✅ 예상/예정 모두 기본 키워드로
 TARGET_KEYWORDS  = ["예상 수주량", "예정 수주량"]
+
+# ✅ 과거 참조(작년/전년/지난해)는 "타깃/호라이즌"으로 절대 잡히면 안 됨
+PAST_MARKERS = ["작년", "전년", "지난해"]
 
 
 # =========================================================
@@ -78,6 +73,7 @@ def load_best_params(path: str | Path) -> Dict | None:
         print(f"Failed to load best params ({path}): {e}")
     return None
 
+
 def save_best_params(path: str | Path, params: Dict) -> None:
     try:
         p = Path(path)
@@ -90,10 +86,16 @@ def save_best_params(path: str | Path, params: Dict) -> None:
 
 
 # =========================================================
-# Target / Feature utils
+# Target / Horizon utils
 # =========================================================
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def _is_past_ref(col: str) -> bool:
+    cc = _norm(col)
+    return any(m in cc for m in PAST_MARKERS)
+
 
 def _extract_horizon_index(col: str) -> Optional[int]:
     """
@@ -103,11 +105,15 @@ def _extract_horizon_index(col: str) -> Optional[int]:
     - 축약형 "T+3" -> 3
     """
     c = _norm(col)
+
+    # 축약형
     if re.fullmatch(r"T", c):
         return 0
     m = re.fullmatch(r"T\+(\d+)", c)
     if m:
         return int(m.group(1))
+
+    # 한국어/기타
     if "T일" in c:
         return 0
     m2 = re.search(r"T\+(\d+)\s*일", c)
@@ -116,37 +122,78 @@ def _extract_horizon_index(col: str) -> Optional[int]:
     m3 = re.search(r"T\+(\d+)", c)
     if m3:
         return int(m3.group(1))
+
     return None
+
+
+def _target_priority(col: str) -> int:
+    """
+    같은 horizon 내에서 정렬 우선순위:
+      0: '예상'
+      1: '예정'
+      9: 기타
+    """
+    cc = _norm(col)
+    if "예상" in cc:
+        return 0
+    if "예정" in cc:
+        return 1
+    return 9
+
 
 def find_target_cols(df: pd.DataFrame, keywords: List[str]) -> List[str]:
     """
-    keywords(예: ["예상 수주량","예정 수주량"]) 중 하나라도 포함 + T일/T+ 포함 컬럼을 타깃으로 간주.
-    horizon index 기준으로 안정 정렬.
+    ✅ 타깃 컬럼 탐지:
+      - keywords(예: ["예상 수주량","예정 수주량"]) 중 하나라도 포함
+      - 그리고 T일/T+ 포함
+      - BUT "작년/전년/지난해" 포함 컬럼은 타깃에서 제외 (가장 중요한 방어)
+
+    반환은 horizon index 기준 안정 정렬 + 같은 horizon 내에서는 예상→예정 우선.
     """
-    cands = []
+    cands: List[str] = []
     for c in df.columns:
         cc = _norm(c)
-        if any(k in cc for k in keywords) and (("T일" in cc) or ("T+" in cc) or re.search(r"\bT(\+\d+)?\b", cc)):
+
+        # (1) 과거 참조는 타깃에서 절대 제외
+        if _is_past_ref(cc):
+            continue
+
+        # (2) keywords + horizon 패턴
+        has_kw = any(k in cc for k in keywords)
+        has_h = ("T일" in cc) or ("T+" in cc) or bool(re.search(r"\bT(\+\d+)?\b", cc))
+        if has_kw and has_h:
             cands.append(c)
 
-    with_h = []
+    tagged = []
     for c in cands:
         h = _extract_horizon_index(c)
-        if h is not None:
-            with_h.append((h, c))
-    no_h = [c for c in cands if _extract_horizon_index(c) is None]
+        if h is None:
+            # horizon 파싱 불가면 맨 뒤로
+            tagged.append((10_000, 9, c))
+        else:
+            tagged.append((h, _target_priority(c), c))
 
-    out = [c for h, c in sorted(with_h, key=lambda x: x[0])] + no_h
+    tagged.sort(key=lambda x: (x[0], x[1], str(x[2])))
+    out = [c for _, _, c in tagged]
+
+    # 중복 제거 (첫 등장 유지)
+    out = list(dict.fromkeys(out))
     return out
+
 
 def select_feature_columns(df: pd.DataFrame, prod_col: str, target_cols: List[str]) -> Tuple[List[str], List[str]]:
     numeric_all = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
     excluded: List[str] = []
 
     def is_future_plan(col: str) -> bool:
-        # ✅ "예정/예상" 둘 다 미래 계획/예측 계열로 간주 (누출 방지)
-        if ("예정 수주량" in col) or ("예상 수주량" in col):
-            if any(tag in col for tag in ["작년", "전년", "지난해"]):
+        """
+        ✅ 누출 방지:
+        - '예상/예정 수주량'은 미래정보로 간주 → feature에서 제외
+        - 단, '작년/전년/지난해'는 과거라서 제외하지 않음 (feature로 쓸 수 있음)
+        """
+        cc = _norm(col)
+        if ("예정 수주량" in cc) or ("예상 수주량" in cc):
+            if _is_past_ref(cc):
                 return False
             return True
         return False
@@ -158,9 +205,11 @@ def select_feature_columns(df: pd.DataFrame, prod_col: str, target_cols: List[st
     num_cols = [c for c in numeric_all if c not in set(excluded + [prod_col])]
     return num_cols, excluded
 
-def build_xy(df: pd.DataFrame, prod_col: str, target_cols: List[str], log_target: bool=False):
+
+def build_xy(df: pd.DataFrame, prod_col: str, target_cols: List[str], log_target: bool = False):
     if prod_col not in df.columns:
         raise ValueError(f"'{prod_col}' 컬럼이 없습니다.")
+
     y = df[target_cols].astype(float).clip(lower=0)
     if log_target:
         y = np.log1p(y)
@@ -211,11 +260,13 @@ def binary_metrics(y_true: np.ndarray, y_score: np.ndarray) -> dict:
         "BestThreshold": best["thr"],
     }
 
+
 def smape(y_true: np.ndarray, y_pred: np.ndarray, eps: float = 1e-8) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     denom = np.abs(y_true) + np.abs(y_pred) + eps
     return float(np.mean(2.0 * np.abs(y_pred - y_true) / denom))
+
 
 def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     y_true = np.asarray(y_true, dtype=float)
@@ -234,6 +285,7 @@ def time_split(df_raw: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame, dt_col: s
     cutoff = dt.quantile(1 - val_ratio)
     idx_tr, idx_va = (dt <= cutoff), (dt > cutoff)
     return X[idx_tr], X[idx_va], y[idx_tr], y[idx_va]
+
 
 def group_split(df_raw: pd.DataFrame, X: pd.DataFrame, y: pd.DataFrame, group_col: str, val_ratio: float, seed: int):
     gss = GroupShuffleSplit(n_splits=1, test_size=val_ratio, random_state=seed)
@@ -293,7 +345,7 @@ def generate_demand_scenarios(
     horizon 간 상관관계를 보존한다.
 
     d_hat: (n, k)
-    residuals: (m, k)  (y_true - y_pred), horizon별 mean=0 (권장)
+    residuals: (m, k)  (y_true - y_pred), horizon별 mean=0 권장(바이어스 완화)
     return: (S, n, k)
     """
     rng = np.random.default_rng(seed)
@@ -316,6 +368,7 @@ def generate_demand_scenarios(
     E = residuals[idx, :]                  # (S, n, k)
     scenarios = np.maximum(0.0, d_hat[None, :, :] + E)
     return scenarios
+
 
 def snapshot_latest_by_product(
     df: pd.DataFrame,
@@ -355,6 +408,7 @@ def snapshot_latest_by_product(
 
     snap = picked.groupby(prod_col, as_index=False)[value_cols].mean(numeric_only=True)
     return snap
+
 
 def scenarios_to_long_csv(
     scenarios: np.ndarray,
@@ -425,6 +479,7 @@ def train_validate(
     residuals = y_true - y_pred
     return model, pd.DataFrame(rows).T, residuals
 
+
 def predict_all(model, X_all, df_raw, prod_col, dt_col, target_cols):
     pred = np.maximum(0.0, np.asarray(model.predict(X_all), dtype=float))
     out = pd.DataFrame(pred, columns=target_cols, index=X_all.index)
@@ -436,6 +491,7 @@ def predict_all(model, X_all, df_raw, prod_col, dt_col, target_cols):
         cols = [prod_col] + target_cols
     return out[cols]
 
+
 def aggregate_by_product(pred_df, prod_col):
     # (참고용) 전체 기간 평균 집계. planner/MC 일관성을 위해 기본 사용은 권장하지 않음.
     tcols = [c for c in pred_df.columns if c not in [prod_col, DEFAULT_DT_COL]]
@@ -445,7 +501,7 @@ def aggregate_by_product(pred_df, prod_col):
 # =========================================================
 # Tuning helpers
 # =========================================================
-def average_metric(metrics_df: pd.DataFrame, target_cols: List[str], metric: str, emphasize: Optional[Dict[str, float]]=None) -> float:
+def average_metric(metrics_df: pd.DataFrame, target_cols: List[str], metric: str, emphasize: Optional[Dict[str, float]] = None) -> float:
     if metric not in metrics_df.columns:
         raise ValueError(f"metrics_df missing metric='{metric}'. cols={list(metrics_df.columns)}")
     w = {t: 1.0 for t in target_cols}
@@ -455,6 +511,7 @@ def average_metric(metrics_df: pd.DataFrame, target_cols: List[str], metric: str
                 w[k] = float(v)
     total_w = sum(w.values())
     return float((metrics_df.loc[target_cols, metric] * pd.Series(w)).sum() / total_w)
+
 
 def _parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
     if not seed_list_str:
@@ -466,6 +523,7 @@ def _parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
     for p in parts:
         out.append(int(p))
     return out
+
 
 def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
     if optuna is None:
@@ -485,7 +543,7 @@ def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
         raise ValueError("--tune_agg must be one of: mean, median")
 
     w_mae = float(args.w_mae)
-    w_sm  = float(args.w_smape)
+    w_sm = float(args.w_smape)
     if w_mae < 0 or w_sm < 0 or (w_mae + w_sm) <= 0:
         raise ValueError("weights must be non-negative and not both zero. (w_mae + w_smape > 0)")
 
@@ -549,7 +607,7 @@ def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
 
 
 # =========================================================
-# Residual pool (OPTION) + residual clip
+# Residual pool + residual clip
 # =========================================================
 def _clip_residuals(residuals: np.ndarray, q: float) -> np.ndarray:
     if q is None or q <= 0:
@@ -567,6 +625,7 @@ def _clip_residuals(residuals: np.ndarray, q: float) -> np.ndarray:
         hi = np.quantile(out[:, j], hi_q)
         out[:, j] = np.clip(out[:, j], lo, hi)
     return out
+
 
 def build_residual_pool(
     args, df, X, y, model_factory,
@@ -643,6 +702,7 @@ def main():
 
     df = pd.read_csv(args.inp)
 
+    # ✅ 타깃 탐지 (작년/전년/지난해 자동 제외)
     target_cols = find_target_cols(df, TARGET_KEYWORDS)
     if not target_cols:
         raise RuntimeError(f"Target columns not found. keywords={TARGET_KEYWORDS}")
