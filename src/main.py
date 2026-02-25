@@ -22,7 +22,11 @@ main.py — End-to-end SCM planning pipeline (ONE-SHOT)
 5) fail_threshold 기본값/CLI 반영 문제 해결
    - parse_args 기본값을 run_pipeline 기본값과 동일하게 맞춤(0.25)
 
-※ 아래 버전은 “지금 너가 올린 main.py”에서 필요한 안전장치들을 끝까지 잠가둔 전체 버전이야.
+[이번 수정 핵심]
+✅ forecast.py(최신 버전)와 100% 정합:
+- find_target_cols: target_kind 기반 호출 (expected/both/planned)
+- build_xy: (target_kind, allow_expected_as_feature, log_target) 시그니처 맞춤
+- planner/MC: 예상(예상 수주량)만 사용 (예정은 기본 제외, 옵션으로만 허용)
 """
 
 from __future__ import annotations
@@ -33,10 +37,11 @@ import json
 import argparse
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Dict
 
 import pandas as pd
 import numpy as np
+from sklearn.metrics import r2_score
 
 # =========================================================
 # Import path
@@ -107,18 +112,20 @@ def _extract_horizon_idx(col: str) -> Optional[int]:
     "T" -> 0
     "T+3" -> 3
     """
+    import re
+
     s = str(col).strip()
     if s == "T":
         return 0
-    m = __import__("re").fullmatch(r"T\+(\d+)", s)
+    m = re.fullmatch(r"T\+(\d+)", s)
     if m:
         return int(m.group(1))
     if "T일" in s:
         return 0
-    m2 = __import__("re").search(r"T\+(\d+)\s*일", s)
+    m2 = re.search(r"T\+(\d+)\s*일", s)
     if m2:
         return int(m2.group(1))
-    m3 = __import__("re").search(r"T\+(\d+)", s)
+    m3 = re.search(r"T\+(\d+)", s)
     if m3:
         return int(m3.group(1))
     return None
@@ -128,8 +135,8 @@ def _select_planner_horizons(
     df: pd.DataFrame,
     *,
     prefer: str = "예상",          # 기본: "예상"만 사용
-    allow_scheduled: bool = False, # 필요 시 "예정"까지 포함(기본 False)
-    max_h: int = 4                 # T..T+4만 쓰고 싶으면 4
+    allow_scheduled: bool = False, # True면 '예정'도 포함 가능
+    max_h: int = 4                 # 0..max_h
 ) -> List[str]:
     """
     planner/MC에서 쓸 horizon 컬럼만 "확실히" 골라낸다.
@@ -138,7 +145,6 @@ def _select_planner_horizons(
     - 기본은 '예상'만 사용
     - allow_scheduled=True면 '예정'도 포함 가능
     - horizon index(0..max_h)만 남김
-    - day_idx 정렬 보장
     """
     cols = list(df.columns)
 
@@ -158,13 +164,13 @@ def _select_planner_horizons(
             if allow_scheduled and ("예정" in s):
                 return True
             return False
-
-        # 혹시 향후 prefer 옵션 늘리면 여기 확장
         return False
 
     picked = [c for c in cols if ok(c)]
-    picked = sorted(picked, key=lambda x: (_extract_horizon_idx(x) or 10_000, 0 if "예상" in str(x) else 1, str(x)))
-
+    picked = sorted(
+        picked,
+        key=lambda x: (_extract_horizon_idx(x) or 10_000, 0 if "예상" in str(x) else 1, str(x)),
+    )
     if not picked:
         raise RuntimeError(
             "planner horizons selection failed.\n"
@@ -174,8 +180,13 @@ def _select_planner_horizons(
     return picked
 
 
+def _horizon_idx_list(max_h: int) -> List[int]:
+    """0..max_h"""
+    return list(range(0, int(max_h) + 1))
+
+
 # =========================================================
-# Forecast helper (그대로 유지, 단: target_cols는 forecast가 처리)
+# Forecast helper (forecast.py 최신 시그니처와 정합)
 # =========================================================
 def _run_forecast_python_api(
     feat_csv: str,
@@ -185,6 +196,7 @@ def _run_forecast_python_api(
     prod_col: str,
     dt_col: str | None,
     best_params_path: str,
+    planner_max_h: int,
     seed: int = 2025,
     split: str = "time",
     val_size: float = 0.2,
@@ -193,14 +205,29 @@ def _run_forecast_python_api(
 ):
     df = pd.read_csv(feat_csv)
 
-    # ✅ "예상/예정" 모두 허용 (forecast 성능 측정 관점)
-    target_cols = FO.find_target_cols(df, ["예상 수주량", "예정 수주량"])
-    if not target_cols:
-        raise RuntimeError("Target columns not found in feat.csv. (예상/예정 수주량 컬럼 확인 필요)")
-
     dt_use = dt_col or (FO.DEFAULT_DT_COL if hasattr(FO, "DEFAULT_DT_COL") else "DateTime")
 
-    X, y, num_cols, cat_cols, _excluded = FO.build_xy(df, prod_col, target_cols, log_target)
+    # ✅ main 정책: planner/MC는 "예상"만 → forecast도 expected를 y로 학습
+    # ✅ horizons는 0..planner_max_h 로 통일 (planner day_idx와 완전 일치)
+    horizons_idx = _horizon_idx_list(planner_max_h)
+    target_cols = FO.find_target_cols(df, target_kind="expected", horizons=horizons_idx)
+
+    if not target_cols:
+        raise RuntimeError(
+            f"Target columns not found in feat.csv. (expected) horizons={horizons_idx}\n"
+            f"columns(head)={list(df.columns)[:40]}"
+        )
+
+    # expected 타깃이면 allow_expected_as_feature는 의미상 False (자기 자신 누수 방지)
+    X, y, num_cols, cat_cols, _excluded = FO.build_xy(
+        df=df,
+        prod_col=prod_col,
+        target_cols=target_cols,
+        target_kind="expected",
+        allow_expected_as_feature=False,
+        log_target=log_target,
+    )
+
     bp = FO.load_best_params(best_params_path) or {}
 
     reg_n_jobs = 1 if deterministic else -1
@@ -215,20 +242,21 @@ def _run_forecast_python_api(
         colsample_bytree=bp.get("colsample_bytree", 0.8),
         reg_lambda=bp.get("reg_lambda", 5.0),
         random_state=seed,
-        deterministic=deterministic,
-        force_row_wise=deterministic,
     )
+    if deterministic:
+        lgbm_params.update(dict(deterministic=True, force_row_wise=True))
 
     model = FO.build_model_pipeline(
-        "lgbm",
-        num_cols,
-        cat_cols,
-        lgbm_params["tweedie_variance_power"],
-        0.5,
-        lgbm_params,
-        reg_n_jobs,
+        model_name="lgbm",
+        num_cols=num_cols,
+        cat_cols=cat_cols,
+        tweedie_power=lgbm_params["tweedie_variance_power"],
+        alpha=0.5,
+        lgbm_params=lgbm_params,
+        reg_n_jobs=reg_n_jobs,
     )
 
+    # split
     if split == "time":
         X_tr, X_va, y_tr, y_va = FO.time_split(df, X, y, dt_use, val_size)
     elif split == "group":
@@ -246,39 +274,40 @@ def _run_forecast_python_api(
     else:
         y_va2 = y_va
 
-    rows = {}
+    # metrics (per-horizon)
+    rows: Dict[str, dict] = {}
     for i, t in enumerate(y.columns):
         yt = y_va2[t].values
         pt = pred_va[:, i]
         rows[t] = {
             "MAE": float(np.mean(np.abs(yt - pt))),
             "RMSE": float(FO.rmse(yt, pt)),
-            "R2": float(FO.r2_score(yt, pt)) if hasattr(FO, "r2_score") else 0.0,
+            "R2": float(r2_score(yt, pt)),
             "SMAPE": float(FO.smape(yt, pt)),
             **FO.binary_metrics(yt, pt),
         }
     metrics_df = pd.DataFrame(rows).T
 
+    # residual pool (validation rows)
     residuals_val = y_va2.values.astype(float) - pred_va.astype(float)
+
+    # full prediction
     pred_all = FO.predict_all(model, X, df, prod_col, dt_use, target_cols)
 
     ensure_dir(os.path.dirname(out_pred_csv))
     pred_all.to_csv(out_pred_csv, index=False, encoding="utf-8-sig")
     metrics_df.to_csv(out_metrics_csv, encoding="utf-8-sig")
 
-    # ✅ 제품단(plan 입력)은 "최신 스냅샷" + value_cols 전달
-    if hasattr(FO, "snapshot_latest_by_product"):
-        prod_snap = FO.snapshot_latest_by_product(
-            pred_all,
-            prod_col=prod_col,
-            dt_col=dt_use,
-            value_cols=target_cols,
-        )
-    else:
-        prod_snap = FO.aggregate_by_product(pred_all, prod_col)
-
+    # ✅ 제품단(plan 입력)은 "최신 스냅샷"
+    prod_snap = FO.snapshot_latest_by_product(
+        pred_all,
+        prod_col=prod_col,
+        dt_col=dt_use,
+        value_cols=target_cols,
+    )
     prod_snap.to_csv(out_pred_by_product_csv, index=False, encoding="utf-8-sig")
 
+    # residual_df_val: validation row 전체 + target_cols 잔차
     df_val = df.loc[X_va.index].copy()
     res_df = pd.DataFrame(residuals_val, columns=target_cols, index=X_va.index)
     keep_cols = [prod_col] + ([dt_use] if dt_use in df_val.columns else [])
@@ -325,8 +354,7 @@ def _sample_scenarios_for_optimization(
             picked = np.unique(np.concatenate([picked, add], axis=0))
 
     if picked.size > n_sample:
-        sub = picked
-        sub_sorted = sub[np.argsort(proxy_short[sub])]
+        sub_sorted = picked[np.argsort(proxy_short[picked])]
         picked = sub_sorted[-n_sample:]
 
     return scenarios_re[picked]
@@ -349,8 +377,8 @@ def run_pipeline(
     skip_llm: bool = False,
     best_params_path: str = "./configs/best_params.json",
     mc_scenarios: int = 0,
-    mc_alpha: float = 0.9,            # MC 검증 요약 분위수
-    cvar_alpha: float | None = None,  # planner CVaR alpha
+    mc_alpha: float = 0.9,
+    cvar_alpha: float | None = None,
     mc_seed: int = 2025,
     mc_wb: float = 1.0,
     mc_wi: float = 0.2,
@@ -366,9 +394,10 @@ def run_pipeline(
     planner_workers: int = 8,
     planner_seed: int = 42,
     min_lot_map_json: str | None = None,
-    # ✅ horizon 정책
-    planner_use_scheduled: bool = False,  # 기본 False: "예상"만 사용
-    planner_max_h: int = 4,               # 기본: T..T+4
+    safety_stock_map_json: str | None = None,
+    weight_map_json: str | None = None,
+    planner_use_scheduled: bool = False,
+    planner_max_h: int = 4,
 ):
     if cvar_alpha is None:
         cvar_alpha = mc_alpha
@@ -397,7 +426,7 @@ def run_pipeline(
     feat_df.to_csv(feat_csv, index=False, encoding="utf-8-sig")
 
     # ---------- 2) Forecast ----------
-    print("[2/6] Forecasting ...")
+    print("[2/6] Forecasting (expected-only targets) ...")
     pred_all, metrics_df, residual_df_val, target_cols_all, dt_use = _run_forecast_python_api(
         feat_csv=feat_csv,
         out_pred_csv=forecast_csv,
@@ -406,6 +435,7 @@ def run_pipeline(
         prod_col=prod_col,
         dt_col=dt_col,
         best_params_path=best_params_path,
+        planner_max_h=planner_max_h,
         seed=mc_seed,
     )
 
@@ -413,11 +443,17 @@ def run_pipeline(
     if mc_scenarios and mc_scenarios > 0:
         print(f"[2.5/6] Generating MC demand scenarios (S={mc_scenarios}) ...")
 
-        # ✅ pred_all/residual_df_val 모두 동일한 dt_col 기준으로 스냅샷/정렬이 되어야 함
-        pred_snap = PO.preprocess_forecast(pred_all.copy(), prod_col=prod_col, dt_col=dt_use)
-        res_snap  = PO.preprocess_forecast(residual_df_val.copy(), prod_col=prod_col, dt_col=dt_use)
+        # (A) d_hat: 제품별 최신 스냅샷(=planner 입력 기준)
+        pred_snap = pd.read_csv(forecast_by_product_csv)
+        pred_snap = PO.preprocess_forecast(pred_snap, prod_col=prod_col, dt_col=dt_use)
+        pred_snap[prod_col] = pred_snap[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
 
-        # ✅ MC도 planner와 동일한 horizon 정책 사용 (예상 only / 과거 제외 / T..T+4)
+        # (B) residual pool: validation row 전체 사용 (축약 금지)
+        res_pool_df = residual_df_val.copy()
+        if prod_col in res_pool_df.columns:
+            res_pool_df[prod_col] = res_pool_df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+
+        # (C) MC horizon: planner와 동일 규칙으로 "예상"만 선택
         horizons_mc = _select_planner_horizons(
             pred_snap,
             prefer="예상",
@@ -425,17 +461,26 @@ def run_pipeline(
             max_h=planner_max_h,
         )
 
-        # residual_df_val에는 target_cols_all(예상/예정)이 있으므로,
-        # horizons_mc가 res_snap에도 존재한다는 전제(정합) — 없으면 즉시 에러로 잡힘.
-        d_hat    = pred_snap[horizons_mc].to_numpy(dtype=float)
-        res_pool = res_snap[horizons_mc].to_numpy(dtype=float)
+        missing_cols = [c for c in horizons_mc if c not in res_pool_df.columns]
+        if missing_cols:
+            raise RuntimeError(
+                "Residual pool missing some horizon columns for MC.\n"
+                f"missing={missing_cols}\n"
+                f"available(head)={list(res_pool_df.columns)[:50]}"
+            )
+
+        d_hat = pred_snap[horizons_mc].to_numpy(dtype=float)        # (P,D)
+        res_pool = res_pool_df[horizons_mc].to_numpy(dtype=float)   # (N_val,D)
+
+        # mean-centering
+        res_pool = res_pool - np.nanmean(res_pool, axis=0, keepdims=True)
 
         scenarios = FO.generate_demand_scenarios(
             d_hat=d_hat,
             residuals=res_pool,
             n_scenarios=int(mc_scenarios),
             seed=int(mc_seed),
-        )
+        )  # (S,P,D)
 
         prod_list = pred_snap[prod_col].astype(str).tolist()
 
@@ -454,6 +499,7 @@ def run_pipeline(
                     )
 
         pd.DataFrame(rows).to_csv(mc_scenarios_csv, index=False, encoding="utf-8-sig")
+        print(f"[OK] Saved MC scenarios: {mc_scenarios_csv} | shape=(S={S}, P={P}, D={D})")
     else:
         print("[2.5/6] MC scenarios disabled")
 
@@ -463,8 +509,8 @@ def run_pipeline(
 
     pred_df = pd.read_csv(forecast_by_product_csv)
     pred_df = PO.preprocess_forecast(pred_df, prod_col=prod_col, dt_col=dt_use)
+    pred_df[prod_col] = pred_df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
 
-    # ✅ planner horizon도 “예상 only + 과거 제외 + T..T+4”로 강제
     horizons_planner = _select_planner_horizons(
         pred_df,
         prefer="예상",
@@ -473,6 +519,8 @@ def run_pipeline(
     )
 
     min_lot_map = _as_int_key_float_map(_load_json_map_or_none(min_lot_map_json))
+    safety_stock_map = _as_int_key_float_map(_load_json_map_or_none(safety_stock_map_json))
+    weight_map = _as_int_key_float_map(_load_json_map_or_none(weight_map_json))
 
     hint_plan = None
     if hint_plan_csv and os.path.exists(hint_plan_csv):
@@ -495,13 +543,10 @@ def run_pipeline(
             product_col=prod_col,
         )
 
-        pred_df[prod_col] = pred_df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
         forecast_products = pred_df[prod_col].tolist()
         scenarios_re = PO.reorder_mc_scenarios_to_forecast(scenarios, mc_products, forecast_products)
 
-        # ✅ planner horizon 길이와 MC D가 맞는지 sanity check
         if scenarios_re.shape[2] != len(horizons_planner):
-            # MC 생성/선택 horizon 정책이 planner와 다르면 여기서 깨져야 맞음
             raise RuntimeError(
                 f"MC horizon D({scenarios_re.shape[2]}) != planner horizons D({len(horizons_planner)}).\n"
                 f"planner horizons={horizons_planner}"
@@ -530,6 +575,8 @@ def run_pipeline(
         int_production=int_production,
         scale=scale,
         min_lot_map=min_lot_map,
+        safety_stock_map=safety_stock_map,
+        weight_map=weight_map,
         hint_plan=hint_plan,
         use_cvar_obj=use_cvar_planner,
         mc_scenarios=scenarios_for_opt,
@@ -553,6 +600,7 @@ def run_pipeline(
         plan_df[prod_col] = plan_df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
 
     plan_df.to_csv(plan_csv, index=False, encoding="utf-8-sig")
+    print(f"[OK] Saved plan: {plan_csv} | rows={len(plan_df)}")
 
     # ---------- 3.5) MC validation (Full S) ----------
     if mc_scenarios and mc_scenarios > 0:
@@ -570,22 +618,30 @@ def run_pipeline(
             product_col=prod_col,
         )
         save_json(mc_validation_json, mc_validation)
+        print(f"[OK] Saved MC validation: {mc_validation_json}")
 
     # ---------- 4) Planning metrics ----------
-    planning_kpi = M.compute_planning_metrics(plan_df, daily_capacity, pd.read_csv(feat_csv), prod_col)
+    planning_kpi = M.compute_planning_metrics(
+        plan_df=plan_df,
+        daily_capacity=float(daily_capacity),
+        feat_df=pd.read_csv(feat_csv),
+        product_col=prod_col,
+    )
     save_json(planning_metrics_json, planning_kpi)
+    print(f"[OK] Saved planning metrics: {planning_metrics_json}")
 
     # ---------- 5) Evaluator / Governance ----------
     audit = EV.audit_and_learn(
         plan_df=plan_df,
         daily_capacity=float(daily_capacity),
-        metrics_summary={"planning_metrics": planning_kpi},
+        metrics_summary={"planning_metrics": planning_kpi, "daily_capacity": float(daily_capacity)},
         policy_path=policy_json,
         product_col=prod_col,
     )
     if isinstance(mc_validation, dict) and mc_validation.get("summary"):
         audit["mc_validation"] = mc_validation.get("summary")
     save_json(audit_json, audit)
+    print(f"[OK] Saved audit: {audit_json}")
 
     # ---------- 6) Report ----------
     if not skip_llm:
@@ -607,6 +663,7 @@ def run_pipeline(
                 f.write(out["markdown"])
             out_html = str(Path(out_md).with_suffix(".html"))
             RL.md_to_html_with_charts(out_md, out_html, out.get("facts"), "주간 운영 계획 보고서")
+            print(f"[OK] Saved report:\n- {out_md}\n- {out_html}")
 
     print("\n[DONE] Pipeline finished.")
 
@@ -631,14 +688,12 @@ def parse_args():
 
     # MC / CVaR
     p.add_argument("--mc_scenarios", type=int, default=0)
-    p.add_argument("--mc_alpha", type=float, default=0.9)     # MC 검증 요약 분위수
-    p.add_argument("--cvar_alpha", type=float, default=None)  # planner CVaR alpha (None이면 mc_alpha 사용)
+    p.add_argument("--mc_alpha", type=float, default=0.9)
+    p.add_argument("--cvar_alpha", type=float, default=None)
     p.add_argument("--mc_seed", type=int, default=2025)
     p.add_argument("--mc_wb", type=float, default=1.0)
     p.add_argument("--mc_wi", type=float, default=0.2)
 
-    # ✅ 여기 기본값이 0.55라서 “CLI 안 주면” mc_validation에 0.55 찍히는 문제가 났던 거야.
-    #    run_pipeline 기본(0.25)과 반드시 맞춰야 함.
     p.add_argument("--fail_threshold", type=float, default=0.25)
 
     # planner
@@ -653,10 +708,12 @@ def parse_args():
     p.add_argument("--planner_workers", type=int, default=8)
     p.add_argument("--planner_seed", type=int, default=42)
     p.add_argument("--min_lot_map", type=str, default=None)
+    p.add_argument("--safety_stock_map", type=str, default=None)
+    p.add_argument("--weight_map", type=str, default=None)
 
-    # ✅ horizon 정책 옵션(필요하면 나중에 켜기)
-    p.add_argument("--planner_use_scheduled", action="store_true")  # True면 '예정'도 포함
-    p.add_argument("--planner_max_h", type=int, default=4)          # 기본 T..T+4
+    # horizon 정책
+    p.add_argument("--planner_use_scheduled", action="store_true")
+    p.add_argument("--planner_max_h", type=int, default=4)
 
     return p.parse_args()
 
@@ -694,6 +751,8 @@ if __name__ == "__main__":
         planner_workers=args.planner_workers,
         planner_seed=args.planner_seed,
         min_lot_map_json=args.min_lot_map,
+        safety_stock_map_json=args.safety_stock_map,
+        weight_map_json=args.weight_map,
         planner_use_scheduled=args.planner_use_scheduled,
         planner_max_h=args.planner_max_h,
     )

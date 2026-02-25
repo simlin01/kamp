@@ -17,9 +17,15 @@ B) capa 없으면 0으로 두지 않고 None 처리
 C) planning_metrics.json을 선택 입력으로 받아 Canonical에 반영
 D) FailRate=0이어도 ShortageRate/BacklogRate가 크면 리스크로 표현하도록 신호등 강화
 E) markdown/ matplotlib 의존성 optional 처리 + HTML에 charts 포함
-F) ✅ (NEW) 현업 리포트 기준으로 "분포(hist)"는 기본 OFF:
+F) ✅ 현업 리포트 기준으로 "분포(hist)"는 기본 OFF:
    - charts_mode: none | summary | dist
    - MC per_scenario는 기본 trim(요약만 유지)하여 Facts 노이즈 감소
+
+[이번 추가 수정: evaluator.py/metrics.py 변경 반영]
+G) ✅ evaluator.py가 생성한 새 MC 스키마( summary: loss_mean/loss_var/loss_cvar, shortage_rate_mean/var/cvar 등 ) 지원
+   - _normalize_mc_validation(): 구/신버전 mc_validation.json을 "공통 Canonical 스키마"로 변환
+   - Canonical Markdown / traffic-light / actions / charts 모두 공통 스키마 기준으로 동작
+H) ✅ evaluator.py가 저장하는 governance_audit.json(안에 mc_validation 포함)도 --mc_json으로 넣으면 자동 인식
 """
 
 from __future__ import annotations
@@ -142,22 +148,205 @@ def _load_json_if_exists(path: str) -> Optional[dict]:
 
 
 # =========================================================
-# ✅ MC dict 호환 유틸 (구버전/신버전)
+# ✅ MC 호환: evaluator 새/구버전 통합 정규화
 # =========================================================
-def _mc_stat(s: dict, metric: str) -> Optional[dict]:
-    if not isinstance(s, dict):
+def _safe_float(x, default=None) -> Optional[float]:
+    try:
+        if x is None:
+            return default
+        v = float(x)
+        if np.isnan(v):
+            return default
+        return v
+    except Exception:
+        return default
+
+
+def _normalize_mc_validation(mc: Optional[dict]) -> Optional[dict]:
+    """
+    입력(mc_json)이 다음 중 무엇이든 받아서 공통 schema로 변환:
+    - (A) evaluator.py 최신: {"verify":..., "per_scenario":[...], "summary":{loss_mean,loss_var,...}, "config":...}
+    - (B) 과거/다른 버전: {"summary": {"ShortageRate": {...}, "Loss": {...}, "FailRate": ...}, "per_scenario":[...]}
+    - (C) governance_audit.json: {"mc_validation": {...}} 를 그대로 넣는 경우
+
+    공통 출력 schema:
+    {
+      "summary": {
+        "ShortageRate": {"mean":..., "p90":..., "max":..., "CVaR":...},
+        "InventoryRate": {"mean":..., "p90":..., "max":..., "CVaR":...},
+        "Loss": {"mean":..., "p90":..., "max":..., "CVaR":...},
+        "FailRate": number
+      },
+      "per_scenario": [... optional ...],
+      "config": {... optional ...}
+    }
+    """
+    if not isinstance(mc, dict):
+        return mc
+
+    # governance_audit.json이 들어온 경우
+    if "mc_validation" in mc and isinstance(mc["mc_validation"], dict):
+        mc = mc["mc_validation"]
+
+    out: Dict[str, Any] = {}
+    per = mc.get("per_scenario")
+    summ = mc.get("summary", mc.get("Summary", None))
+    cfg = mc.get("config") if isinstance(mc.get("config"), dict) else None
+
+    # 기본 per_scenario 정리 (list of dict)
+    per_list: List[dict] = []
+    if isinstance(per, list):
+        for r in per:
+            if isinstance(r, dict):
+                per_list.append(r)
+
+    # 1) 이미 구버전 nested-dict 형태면 그대로 최대한 활용
+    #    예: summary["ShortageRate"] = {"mean":..,"p90":..,"max":..,"CVaR":..}
+    if isinstance(summ, dict) and any(isinstance(summ.get(k), dict) for k in ["ShortageRate", "BacklogRate", "Loss", "InventoryRate"]):
+        summary_norm: Dict[str, Any] = {}
+        # ShortageRate 우선, 없으면 BacklogRate
+        if isinstance(summ.get("ShortageRate"), dict):
+            summary_norm["ShortageRate"] = dict(summ["ShortageRate"])
+        elif isinstance(summ.get("BacklogRate"), dict):
+            summary_norm["ShortageRate"] = dict(summ["BacklogRate"])
+
+        if isinstance(summ.get("InventoryRate"), dict):
+            summary_norm["InventoryRate"] = dict(summ["InventoryRate"])
+        if isinstance(summ.get("Loss"), dict):
+            summary_norm["Loss"] = dict(summ["Loss"])
+
+        fr = summ.get("FailRate", summ.get("fail_rate", None))
+        summary_norm["FailRate"] = _safe_float(fr, 0.0) if fr is not None else 0.0
+
+        out["summary"] = summary_norm
+        if per_list:
+            out["per_scenario"] = per_list
+        if cfg:
+            out["config"] = cfg
+        return out
+
+    # 2) evaluator 최신 summary(flat keys) 지원
+    summary_norm2: Dict[str, Any] = {}
+
+    if isinstance(summ, dict):
+        # loss
+        loss_mean = _safe_float(summ.get("loss_mean"), None)
+        loss_var = _safe_float(summ.get("loss_var"), None)
+        loss_cvar = _safe_float(summ.get("loss_cvar"), None)
+
+        # shortage_rate
+        sr_mean = _safe_float(summ.get("shortage_rate_mean"), None)
+        sr_var = _safe_float(summ.get("shortage_rate_var"), None)
+        sr_cvar = _safe_float(summ.get("shortage_rate_cvar"), None)
+
+        # max는 per_scenario에서 추정
+        loss_max = None
+        sr_max = None
+        inv_mean = None
+        inv_var = None
+        inv_cvar = None
+        inv_max = None
+        fail_rate = None
+
+        if per_list:
+            try:
+                loss_vals = [float(r.get("loss")) for r in per_list if r.get("loss") is not None]
+                if loss_vals:
+                    loss_max = float(np.max(loss_vals))
+                    if loss_mean is None:
+                        loss_mean = float(np.mean(loss_vals))
+                    if loss_var is None:
+                        loss_var = float(np.quantile(loss_vals, 0.9))
+                    if loss_cvar is None:
+                        var0 = float(np.quantile(loss_vals, 0.9))
+                        tail = [v for v in loss_vals if v >= var0]
+                        loss_cvar = float(np.mean(tail)) if tail else var0
+
+                sr_vals = [float(r.get("ShortageRate")) for r in per_list if r.get("ShortageRate") is not None]
+                if sr_vals:
+                    sr_max = float(np.max(sr_vals))
+                    if sr_mean is None:
+                        sr_mean = float(np.mean(sr_vals))
+                    if sr_var is None:
+                        sr_var = float(np.quantile(sr_vals, 0.9))
+                    if sr_cvar is None:
+                        var0 = float(np.quantile(sr_vals, 0.9))
+                        tail = [v for v in sr_vals if v >= var0]
+                        sr_cvar = float(np.mean(tail)) if tail else var0
+
+                inv_vals = [float(r.get("InventoryRate")) for r in per_list if r.get("InventoryRate") is not None]
+                if inv_vals:
+                    inv_max = float(np.max(inv_vals))
+                    inv_mean = float(np.mean(inv_vals))
+                    inv_var = float(np.quantile(inv_vals, 0.9))
+                    var0 = inv_var
+                    tail = [v for v in inv_vals if v >= var0]
+                    inv_cvar = float(np.mean(tail)) if tail else var0
+
+                fail_vals = [1.0 if bool(r.get("fail")) else 0.0 for r in per_list]
+                if fail_vals:
+                    fail_rate = float(np.mean(fail_vals))
+            except Exception:
+                pass
+
+        # Loss
+        if loss_mean is not None or loss_var is not None or loss_max is not None or loss_cvar is not None:
+            summary_norm2["Loss"] = {
+                "mean": loss_mean,
+                "p90": loss_var,   # evaluator: loss_var는 alpha 분위수
+                "max": loss_max,
+                "CVaR": loss_cvar,
+            }
+
+        # ShortageRate
+        if sr_mean is not None or sr_var is not None or sr_max is not None or sr_cvar is not None:
+            summary_norm2["ShortageRate"] = {
+                "mean": sr_mean,
+                "p90": sr_var,
+                "max": sr_max,
+                "CVaR": sr_cvar,
+            }
+
+        # InventoryRate (evaluator 최신 summary는 inv까지 안 넣지만 per_scenario에서 계산 가능)
+        if inv_mean is not None or inv_var is not None or inv_max is not None or inv_cvar is not None:
+            summary_norm2["InventoryRate"] = {
+                "mean": inv_mean,
+                "p90": inv_var,
+                "max": inv_max,
+                "CVaR": inv_cvar,
+            }
+
+        summary_norm2["FailRate"] = float(fail_rate) if fail_rate is not None else 0.0
+
+    if summary_norm2:
+        out["summary"] = summary_norm2
+    else:
+        out["summary"] = {"FailRate": 0.0}
+
+    if per_list:
+        out["per_scenario"] = per_list
+    if cfg:
+        out["config"] = cfg
+    return out
+
+
+# =========================================================
+# MC dict 호환 유틸 (공통 schema 기준)
+# =========================================================
+def _mc_stat(summary: dict, metric: str) -> Optional[dict]:
+    if not isinstance(summary, dict):
         return None
-    v = s.get(metric)
+    v = summary.get(metric)
     return v if isinstance(v, dict) else None
 
 
-def _mc_get(s: dict, metric: str, field: str, default=None):
+def _mc_get(summary: dict, metric: str, field: str, default=None):
     """
     field alias:
       - p90 ↔ VaR
       - max ↔ worst
     """
-    d = _mc_stat(s, metric)
+    d = _mc_stat(summary, metric)
     if not d:
         return default
 
@@ -189,10 +378,8 @@ def _trim_mc_validation(mc: Optional[dict], keep_per_scenario: bool) -> Optional
     if not isinstance(mc, dict):
         return mc
     out = dict(mc)
-    # 보통 {"summary":..., "per_scenario":[...]} 형태
     if not keep_per_scenario:
-        if "per_scenario" in out:
-            out.pop("per_scenario", None)
+        out.pop("per_scenario", None)
     return out
 
 
@@ -481,7 +668,7 @@ def summarize_metrics(metrics_csv: str) -> Dict:
 
     df = _dedup_columns(pd.read_csv(metrics_csv))
     cols = {c.lower(): c for c in df.columns}
-    col_h = _pick(cols, ["horizon", "target", "label", "기간", "예상"])
+    col_h = _pick(cols, ["horizon", "target", "label", "기간", "예상", "예정"])
     col_mae = _pick(cols, ["mae"])
     col_r2 = _pick(cols, ["r2"])
 
@@ -774,33 +961,31 @@ def _charts_from_facts_base64(facts: dict, charts_mode: str) -> List[Tuple[str, 
         if isinstance(per, list) and len(per) > 0:
             try:
                 sr = [float(x.get("ShortageRate")) for x in per if x.get("ShortageRate") is not None]
-                if not sr:
-                    sr = [float(x.get("BacklogRate")) for x in per if x.get("BacklogRate") is not None]
                 if sr:
                     plt.figure()
                     plt.hist(sr, bins=20)
-                    plt.title("MC ServiceRisk distribution")
-                    plt.xlabel("ShortageRate (or BacklogRate)")
+                    plt.title("MC ShortageRate distribution")
+                    plt.xlabel("ShortageRate")
                     plt.ylabel("count")
                     buf = io.BytesIO()
                     plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
                     plt.close()
-                    charts.append(("MC 서비스 리스크 분포(Shortage/Backlog)", base64.b64encode(buf.getvalue()).decode("ascii")))
+                    charts.append(("MC ShortageRate 분포", base64.b64encode(buf.getvalue()).decode("ascii")))
             except Exception:
                 pass
 
             try:
-                loss = [float(x.get("Loss")) for x in per if x.get("Loss") is not None]
+                loss = [float(x.get("loss")) for x in per if x.get("loss") is not None]
                 if loss:
                     plt.figure()
                     plt.hist(loss, bins=20)
-                    plt.title("MC Loss distribution")
-                    plt.xlabel("Loss")
+                    plt.title("MC loss distribution")
+                    plt.xlabel("loss")
                     plt.ylabel("count")
                     buf = io.BytesIO()
                     plt.savefig(buf, format="png", bbox_inches="tight", dpi=160)
                     plt.close()
-                    charts.append(("MC Loss 분포", base64.b64encode(buf.getvalue()).decode("ascii")))
+                    charts.append(("MC loss 분포", base64.b64encode(buf.getvalue()).decode("ascii")))
             except Exception:
                 pass
 
@@ -915,7 +1100,7 @@ def verify_report(model_json: dict, facts: dict, cfg: LLMConfig) -> Dict:
 
 
 # =========================================================
-# Canonical renderer (원본 로직 유지)
+# Canonical renderer
 # =========================================================
 def _grade_traffic_light(facts: dict) -> dict:
     rep = facts.get("plan_summary_rep") or {}
@@ -932,8 +1117,8 @@ def _grade_traffic_light(facts: dict) -> dict:
 
     mc = facts.get("mc_validation") or {}
     s = mc.get("summary", mc) if isinstance(mc, dict) else {}
-    fail = float(s.get("FailRate", 0.0) or 0.0)
 
+    fail = float(s.get("FailRate", 0.0) or 0.0)
     service_metric_name, _ = _mc_pick_service_metric(s)
     sr_v = _mc_get(s, service_metric_name, "VaR", None)
     sr_worst = _mc_get(s, service_metric_name, "worst", None)
@@ -941,6 +1126,7 @@ def _grade_traffic_light(facts: dict) -> dict:
     def _lvl(v):
         return {"green": 0, "yellow": 1, "red": 2}.get(v, 1)
 
+    # ✅ deterministic backlog=0이어도 MC VaR/worst/fail 기반으로 신호등 반영
     if total_backlog > 0:
         service = "red"
     elif sr_v is not None and float(sr_v) >= 0.10:
@@ -1091,16 +1277,26 @@ def _render_canonical_md(facts: dict) -> str:
         md.append("")
         md.append("| 지표 | mean | p90(VaR) | max(worst) |")
         md.append("|---|---:|---:|---:|")
+
         svc_name, _ = _mc_pick_service_metric(s)
         if _mc_stat(s, svc_name):
             md.append(f"| {svc_name} | {_fmt(_mc_get(s, svc_name, 'mean'),4)} | {_fmt(_mc_get(s, svc_name, 'p90'),4)} | {_fmt(_mc_get(s, svc_name, 'max'),4)} |")
+            cvar = _mc_get(s, svc_name, "CVaR", None)
+            if cvar is not None:
+                md.append(f"\n- **{svc_name} CVaR(alpha)**: {_fmt(cvar,4)}")
+
         if _mc_stat(s, "InventoryRate"):
             md.append(f"| InventoryRate | {_fmt(_mc_get(s,'InventoryRate','mean'),4)} | {_fmt(_mc_get(s,'InventoryRate','p90'),4)} | {_fmt(_mc_get(s,'InventoryRate','max'),4)} |")
+            cvar = _mc_get(s, "InventoryRate", "CVaR", None)
+            if cvar is not None:
+                md.append(f"\n- **InventoryRate CVaR(alpha)**: {_fmt(cvar,4)}")
+
         if _mc_stat(s, "Loss"):
             md.append(f"| Loss | {_fmt(_mc_get(s,'Loss','mean'),4)} | {_fmt(_mc_get(s,'Loss','p90'),4)} | {_fmt(_mc_get(s,'Loss','max'),4)} |")
             cvar = _mc_get(s, "Loss", "CVaR", None)
             if cvar is not None:
                 md.append(f"\n- **Loss CVaR(alpha)**: {_fmt(cvar,4)}")
+
         md.append("")
         md.append(f"- **FailRate**: {_fmt(s.get('FailRate', 0.0),4)}  (정의: 임계 기준을 넘는 시나리오 비율)")
         md.append("")
@@ -1124,7 +1320,7 @@ def _render_canonical_md(facts: dict) -> str:
         md.append("### 4.1 증가 필요 품목(백로그 상위)")
         md.append("")
         md.append("| 품목 | 백로그 합 |")
-        md.append("|---|---:|")
+        md.append("|---|---:|---|")
         for d in top_inc[:5]:
             md.append(f"| {d.get('Product_Number','?')} | {_fmt(d.get('backlog', d.get('sum_backlog',0.0)),1)} |")
         md.append("")
@@ -1277,8 +1473,8 @@ def build_report_with_llm(
     max_head_rows: int = 40,
     max_chars: int = 6000,
     auto_regen_on_fail: bool = True,
-    charts_mode: str = "summary",          # ✅ NEW
-    keep_mc_per_scenario: bool = False,    # ✅ NEW (default: trim)
+    charts_mode: str = "summary",
+    keep_mc_per_scenario: bool = False,
 ) -> Dict:
     cfg = LLMConfig(model=model_name)
 
@@ -1297,8 +1493,11 @@ def build_report_with_llm(
     product_summary = summarize_by_product(plans[0]) if plans else {}
 
     pm = _load_json_if_exists(planning_metrics_json) if planning_metrics_json else None
+
+    # ✅ MC: 읽고 → (구/신 스키마) 정규화 → 기본은 per_scenario trim
     mc_raw = _load_json_if_exists(mc_json) if mc_json else None
-    mc_summary = _trim_mc_validation(mc_raw, keep_per_scenario=keep_mc_per_scenario)
+    mc_norm = _normalize_mc_validation(mc_raw)
+    mc_norm = _trim_mc_validation(mc_norm, keep_per_scenario=keep_mc_per_scenario)
 
     facts = {
         "plan_scenarios": plans_summary,
@@ -1306,9 +1505,9 @@ def build_report_with_llm(
         "metrics_summary": metrics_sum,
         "forecast_summary": forecast_sum,
         "product_summary": product_summary,
-        "mc_validation": mc_summary,
+        "mc_validation": mc_norm,
         "planning_metrics": pm,
-        "_charts_mode": charts_mode,  # html 렌더러 전달
+        "_charts_mode": charts_mode,
     }
     facts["rule_based_actions"] = generate_rule_based_actions(facts)
 
@@ -1384,9 +1583,9 @@ def main():
     p.add_argument("--out_verify", default="weekly_report.verify.txt")
     p.add_argument("--no_regen", action="store_true", help="검증 실패 시 재생성 비활성화")
     p.add_argument("--feat", default="./data/feat.csv", help="(유지) features.py가 만든 feat.csv 경로")
-    p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로")
+    p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로 (mc_validation.json 또는 governance_audit.json도 허용)")
 
-    # ✅ NEW: charts / mc trim 옵션
+    # ✅ charts / mc trim 옵션
     p.add_argument("--charts_mode", default="summary", choices=["none", "summary", "dist"],
                    help="HTML에 포함할 차트 수준: none(없음) | summary(Top5) | dist(분포까지)")
     p.add_argument("--keep_mc_per_scenario", action="store_true",

@@ -2,20 +2,28 @@
 # -*- coding: utf-8 -*-
 
 """
-forecast.py — Multi-Target Tweedie/LGBM Forecast (feat.csv → predict)
+forecast.py — Leakage-safe Multi-Horizon Forecast (feat.csv → predict)
 
-[핵심 목표]
-- ✅ Target(horizon) 탐지를 "예상/예정 수주량" 모두 지원하면서도,
-  '작년/전년/지난해' 같은 과거 참조 컬럼이 타깃/호라이즌으로 섞이는 문제를 확실히 차단
-- ✅ Leakage 방지 규칙 보강: feature 선택 시 "예상/예정 수주량"은 미래정보로 간주하여 제외
-  (단, 작년/전년/지난해는 과거라서 제외하지 않음)
-- ✅ planner 입력(pred_final_by_product.csv)과 MC 기준(d_hat)의 시점 기준을 최신 스냅샷으로 통일
-- ✅ MC 시나리오: 잔차 벡터(resample)로 horizon 상관 보존 + mean-centering(바이어스 완화)
+[수정 핵심(현 파이프라인 기준 권장)]
+- ✅ y(타깃)는 기본적으로 "예정 수주량"만 사용 (planner 입력/수요 예측의 정석)
+- ✅ "예상 수주량"은 기본적으로 feature로 활용(=기존 baseline forecast 보정) 가능
+  - 단, 원하면 옵션으로 feature 제외/타깃 전환 가능
+- ✅ '작년/전년/지난해'는 과거 참조이므로
+  - 타깃에서 무조건 제외 (누수/혼입 방지)
+  - feature로는 적극 허용
+- ✅ horizon 선택 가능(기본 T+1~T+4). planner와 MC day_idx 정의가 깔끔해짐.
+- ✅ MC 시나리오: 잔차 벡터 resample로 horizon 상관 보존 + mean-centering
+- ✅ planner 입력(pred_*_by_product.csv)과 MC d_hat은 "제품별 최신 스냅샷" 기준으로 통일
+
+[추가 안정화(매우 중요)]
+- ✅ find_target_cols: 구버전 호출(키워드 리스트 전달)과 신버전 호출(target_kind str) 모두 허용
+- ✅ build_xy: 구버전 호출(build_xy(df, prod_col, target_cols, log_target))이 깨지지 않도록
+          시그니처를 (log_target이 4번째 포지션)으로 호환
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple, Dict, Optional
+from typing import List, Tuple, Dict, Optional, Union
 import argparse
 import re
 import json
@@ -51,11 +59,13 @@ except Exception:
 DEFAULT_PROD_COL = "Product_Number"
 DEFAULT_DT_COL   = "DateTime"
 
-# ✅ 예상/예정 모두 기본 키워드로
-TARGET_KEYWORDS  = ["예상 수주량", "예정 수주량"]
-
-# ✅ 과거 참조(작년/전년/지난해)는 "타깃/호라이즌"으로 절대 잡히면 안 됨
 PAST_MARKERS = ["작년", "전년", "지난해"]
+
+KIND_TO_KEYWORDS = {
+    "planned":  ["예정 수주량"],   # y 기본(권장)
+    "expected": ["예상 수주량"],   # baseline forecast
+    "both":     ["예상 수주량", "예정 수주량"],
+}
 
 
 # =========================================================
@@ -129,84 +139,170 @@ def _extract_horizon_index(col: str) -> Optional[int]:
 def _target_priority(col: str) -> int:
     """
     같은 horizon 내에서 정렬 우선순위:
-      0: '예상'
-      1: '예정'
+      0: '예정'
+      1: '예상'
       9: 기타
     """
     cc = _norm(col)
-    if "예상" in cc:
-        return 0
     if "예정" in cc:
+        return 0
+    if "예상" in cc:
         return 1
     return 9
 
 
-def find_target_cols(df: pd.DataFrame, keywords: List[str]) -> List[str]:
+def _parse_horizons(s: str) -> List[int]:
     """
-    ✅ 타깃 컬럼 탐지:
-      - keywords(예: ["예상 수주량","예정 수주량"]) 중 하나라도 포함
-      - 그리고 T일/T+ 포함
-      - BUT "작년/전년/지난해" 포함 컬럼은 타깃에서 제외 (가장 중요한 방어)
+    예: "1,2,3,4" -> [1,2,3,4]
+    예: "0,1,2"   -> [0,1,2]
+    """
+    parts = [p.strip() for p in str(s).split(",") if p.strip() != ""]
+    hs = []
+    for p in parts:
+        hs.append(int(p))
+    hs = sorted(list(dict.fromkeys(hs)))
+    return hs
 
-    반환은 horizon index 기준 안정 정렬 + 같은 horizon 내에서는 예상→예정 우선.
+
+def _find_target_cols_by_keywords(
+    df: pd.DataFrame,
+    keywords: List[str],
+    horizons: Optional[List[int]] = None,
+) -> List[str]:
+    """
+    구버전 호환용: keywords(예: ["예상 수주량","예정 수주량"])를 직접 받아 타깃 탐지.
+    - 과거 참조('작년/전년/지난해')는 무조건 제외
+    - horizon 패턴 포함
+    - horizons가 주어지면 그 h만 남김
     """
     cands: List[str] = []
     for c in df.columns:
         cc = _norm(c)
 
-        # (1) 과거 참조는 타깃에서 절대 제외
         if _is_past_ref(cc):
             continue
 
-        # (2) keywords + horizon 패턴
         has_kw = any(k in cc for k in keywords)
         has_h = ("T일" in cc) or ("T+" in cc) or bool(re.search(r"\bT(\+\d+)?\b", cc))
-        if has_kw and has_h:
-            cands.append(c)
+        if not (has_kw and has_h):
+            continue
+
+        h = _extract_horizon_index(cc)
+        if horizons is not None and h is not None:
+            if h not in set(horizons):
+                continue
+
+        cands.append(c)
 
     tagged = []
     for c in cands:
         h = _extract_horizon_index(c)
         if h is None:
-            # horizon 파싱 불가면 맨 뒤로
             tagged.append((10_000, 9, c))
         else:
             tagged.append((h, _target_priority(c), c))
 
     tagged.sort(key=lambda x: (x[0], x[1], str(x[2])))
     out = [c for _, _, c in tagged]
-
-    # 중복 제거 (첫 등장 유지)
     out = list(dict.fromkeys(out))
     return out
 
 
-def select_feature_columns(df: pd.DataFrame, prod_col: str, target_cols: List[str]) -> Tuple[List[str], List[str]]:
+def find_target_cols(
+    df: pd.DataFrame,
+    target_kind: Union[str, List[str], Tuple[str, ...]],
+    horizons: Optional[List[int]] = None,
+) -> List[str]:
+    """
+    ✅ 타깃 컬럼 탐지 (호환 포함)
+
+    [신버전 사용]
+      find_target_cols(df, target_kind="planned"|"expected"|"both", horizons=[1,2,3,4])
+
+    [구버전 호환]
+      find_target_cols(df, ["예상 수주량","예정 수주량"], horizons=[...])
+
+    공통 정책:
+      - '작년/전년/지난해' 포함 컬럼은 타깃에서 무조건 제외 (누수/혼입 방지)
+      - (h, priority, name) 정렬
+    """
+    # ---- 구버전: 키워드 리스트를 넘긴 경우 ----
+    if isinstance(target_kind, (list, tuple)):
+        keywords = [str(x) for x in target_kind]
+        return _find_target_cols_by_keywords(df, keywords=keywords, horizons=horizons)
+
+    # ---- 신버전: kind 문자열 ----
+    if target_kind not in KIND_TO_KEYWORDS:
+        raise ValueError(f"invalid target_kind={target_kind}. choose from {list(KIND_TO_KEYWORDS.keys())}")
+    keywords = KIND_TO_KEYWORDS[target_kind]
+    return _find_target_cols_by_keywords(df, keywords=keywords, horizons=horizons)
+
+
+# =========================================================
+# Feature selection (leakage control)
+# =========================================================
+def select_feature_columns(
+    df: pd.DataFrame,
+    prod_col: str,
+    target_cols: List[str],
+    target_kind: str,
+    allow_expected_as_feature: bool,
+) -> Tuple[List[str], List[str]]:
+    """
+    기본 정책(권장):
+    - y가 planned(예정)일 때: '예상 수주량'(non-past)은 feature로 허용 가능(보정 모델)
+    - y가 expected 또는 both일 때: 예/예정(non-past) 모두 feature에서 제외(보수적으로 누수 방지)
+    - 작년/전년/지난해는 과거로 간주 → feature 허용
+    """
     numeric_all = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
     excluded: List[str] = []
 
-    def is_future_plan(col: str) -> bool:
-        """
-        ✅ 누출 방지:
-        - '예상/예정 수주량'은 미래정보로 간주 → feature에서 제외
-        - 단, '작년/전년/지난해'는 과거라서 제외하지 않음 (feature로 쓸 수 있음)
-        """
+    def _is_nonpast_expected(col: str) -> bool:
         cc = _norm(col)
-        if ("예정 수주량" in cc) or ("예상 수주량" in cc):
-            if _is_past_ref(cc):
-                return False
-            return True
-        return False
+        return ("예상 수주량" in cc) and (not _is_past_ref(cc))
+
+    def _is_nonpast_planned(col: str) -> bool:
+        cc = _norm(col)
+        return ("예정 수주량" in cc) and (not _is_past_ref(cc))
 
     for c in list(numeric_all):
-        if c in target_cols or c == prod_col or is_future_plan(c):
+        if c in target_cols or c == prod_col:
             excluded.append(c)
+            continue
+
+        if target_kind == "planned":
+            if _is_nonpast_planned(c):
+                excluded.append(c)
+                continue
+            if _is_nonpast_expected(c) and (not allow_expected_as_feature):
+                excluded.append(c)
+                continue
+        else:
+            if _is_nonpast_expected(c) or _is_nonpast_planned(c):
+                excluded.append(c)
+                continue
 
     num_cols = [c for c in numeric_all if c not in set(excluded + [prod_col])]
     return num_cols, excluded
 
 
-def build_xy(df: pd.DataFrame, prod_col: str, target_cols: List[str], log_target: bool = False):
+def build_xy(
+    df: pd.DataFrame,
+    prod_col: str,
+    target_cols: List[str],
+    log_target: bool = False,
+    target_kind: str = "planned",
+    allow_expected_as_feature: bool = True,
+):
+    """
+    ✅ backward-compatible signature
+
+    - 구버전(많이 쓰던 형태):
+        X, y, num_cols, cat_cols, excluded = build_xy(df, prod_col, target_cols, log_target)
+
+    - 신버전:
+        build_xy(df, prod_col, target_cols, log_target=False, target_kind="planned", allow_expected_as_feature=True)
+    """
     if prod_col not in df.columns:
         raise ValueError(f"'{prod_col}' 컬럼이 없습니다.")
 
@@ -214,7 +310,13 @@ def build_xy(df: pd.DataFrame, prod_col: str, target_cols: List[str], log_target
     if log_target:
         y = np.log1p(y)
 
-    num_cols, excluded = select_feature_columns(df, prod_col, target_cols)
+    num_cols, excluded = select_feature_columns(
+        df=df,
+        prod_col=prod_col,
+        target_cols=target_cols,
+        target_kind=target_kind,
+        allow_expected_as_feature=allow_expected_as_feature,
+    )
     cat_cols = [prod_col]
     if len(num_cols) == 0:
         raise RuntimeError("사용 가능한 수치형 피처가 없습니다. features.py를 확인하세요.")
@@ -492,12 +594,6 @@ def predict_all(model, X_all, df_raw, prod_col, dt_col, target_cols):
     return out[cols]
 
 
-def aggregate_by_product(pred_df, prod_col):
-    # (참고용) 전체 기간 평균 집계. planner/MC 일관성을 위해 기본 사용은 권장하지 않음.
-    tcols = [c for c in pred_df.columns if c not in [prod_col, DEFAULT_DT_COL]]
-    return pred_df.groupby(prod_col)[tcols].mean(numeric_only=True).reset_index()
-
-
 # =========================================================
 # Tuning helpers
 # =========================================================
@@ -519,10 +615,7 @@ def _parse_seed_list(seed_list_str: Optional[str]) -> Optional[List[int]]:
     parts = [p.strip() for p in seed_list_str.split(",") if p.strip()]
     if not parts:
         return None
-    out = []
-    for p in parts:
-        out.append(int(p))
-    return out
+    return [int(p) for p in parts]
 
 
 def tune_params(args, df, X, y, num_cols, cat_cols, target_cols):
@@ -659,7 +752,8 @@ def build_residual_pool(
 # CLI main
 # =========================================================
 def main():
-    ap = argparse.ArgumentParser(description="Leakage-safe Forecast (multi-seed tuning + MAE/SMAPE + refit + MC)")
+    ap = argparse.ArgumentParser(description="Leakage-safe Forecast (planned target default) + refit + MC")
+
     ap.add_argument("--in", dest="inp", required=True)
     ap.add_argument("--out", dest="out", required=True)
     ap.add_argument("--metrics_out", default=None)
@@ -672,6 +766,18 @@ def main():
     ap.add_argument("--split", default="time", choices=["time", "group", "random"])
     ap.add_argument("--model", default="lgbm", choices=["tweedie", "lgbm"])
     ap.add_argument("--log_target", action="store_true")
+
+    # ✅ y(타깃) 정의
+    ap.add_argument("--target_kind", default="planned", choices=["planned", "expected", "both"],
+                    help="planned(예정) | expected(예상) | both(예상+예정). 기본 planned 권장")
+    ap.add_argument("--horizons", default="1,2,3,4",
+                    help="예측할 horizon 인덱스. 예: '1,2,3,4' (기본: T+1~T+4). '0,1,2,3,4'도 가능")
+
+    # ✅ feature에서 예상 수주량 활용 여부(기본: planned 타깃이면 True)
+    ap.add_argument("--allow_expected_as_feature", action="store_true",
+                    help="planned 타깃일 때, non-past '예상 수주량'을 feature로 허용(권장).")
+    ap.add_argument("--disallow_expected_as_feature", action="store_true",
+                    help="planned 타깃이어도 '예상 수주량'을 feature에서 제외(보수적).")
 
     # tuning
     ap.add_argument("--tune", action="store_true")
@@ -695,19 +801,42 @@ def main():
     # MC options
     ap.add_argument("--mc_scenarios", type=int, default=0)
     ap.add_argument("--mc_out", default=None)
-    ap.add_argument("--mc_mode", default="raw", choices=["raw", "product"])
+    ap.add_argument("--mc_mode", default="product", choices=["raw", "product"])
     ap.add_argument("--mc_out_csv", default=None)
 
     args = ap.parse_args()
 
+    horizons = _parse_horizons(args.horizons)
+
+    # allow_expected_as_feature 기본값 결정
+    if args.target_kind == "planned":
+        allow_expected_as_feature = True
+        if args.disallow_expected_as_feature:
+            allow_expected_as_feature = False
+        if args.allow_expected_as_feature:
+            allow_expected_as_feature = True
+    else:
+        allow_expected_as_feature = False
+
     df = pd.read_csv(args.inp)
 
-    # ✅ 타깃 탐지 (작년/전년/지난해 자동 제외)
-    target_cols = find_target_cols(df, TARGET_KEYWORDS)
+    # ✅ 타깃 탐지 (작년/전년/지난해 자동 제외 + horizon 필터)
+    target_cols = find_target_cols(df, target_kind=args.target_kind, horizons=horizons)
     if not target_cols:
-        raise RuntimeError(f"Target columns not found. keywords={TARGET_KEYWORDS}")
+        raise RuntimeError(f"Target columns not found. target_kind={args.target_kind}, horizons={horizons}")
 
-    X, y, num_cols, cat_cols, excluded = build_xy(df, args.prod_col, target_cols, args.log_target)
+    print(f"[INFO] target_kind={args.target_kind} | horizons={horizons} | targets={len(target_cols)}")
+    if args.target_kind == "planned":
+        print(f"[INFO] allow_expected_as_feature={allow_expected_as_feature}")
+
+    X, y, num_cols, cat_cols, excluded = build_xy(
+        df=df,
+        prod_col=args.prod_col,
+        target_cols=target_cols,
+        log_target=args.log_target,
+        target_kind=args.target_kind,
+        allow_expected_as_feature=allow_expected_as_feature,
+    )
 
     # -------------------------
     # (A) 튜닝 or load params
@@ -869,6 +998,7 @@ def main():
             prod_col=args.prod_col,
             dt_col=args.dt_col,
             mc_mode=args.mc_mode,
+            target_kind=args.target_kind,
         )
         if products_for_save is not None:
             save_kwargs["products"] = np.array(products_for_save, dtype=object)

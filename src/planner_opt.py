@@ -4,20 +4,12 @@
 """
 planner_opt.py — CP-SAT 생산계획 (CVaR objective)
 
-[이번 수정의 핵심]
-✅ horizon(타깃) 오염 차단을 planner 쪽에서도 "확실히" 한다
-- forecast.py에서 이미 '작년/전년/지난해' 타깃 제외를 넣었지만,
-  planner_opt.detect_horizons()도 동일하게 방어해야 end-to-end에서 절대 안 섞임.
-- 특히 pred_final_by_product.csv에는 '작년 T+... 예정 수주량' 같은 컬럼이 섞일 수 있으니,
-  detect_horizons에서 과거 참조(PAST_MARKERS)는 후보에서 제거.
-
-✅ horizon 정렬은 한국어/축약형 모두 안정적으로 day_idx=0..D-1 정렬
-- _sort_horizons_kor()를 항상 적용
-
-✅ prod_col / dt_col 정합성 유지
-- preprocess_forecast, load_cluster_info, load_hint_plan_csv, load_mc_scenarios 등 prod_col 인자 유지
-
-※ 최적화 모델(CVaR 정의/로직)은 사용자가 주신 버전을 그대로 유지(정합성 목적).
+[정합성/안전장치 강화 요약]
+✅ (1) optimize_plan에서 dt_col 하드코딩 제거 (DateTime 강제 X)
+✅ (2) horizons를 normalize해서 df.columns와 1:1 매칭 (weird space/유니코드 이슈 방어)
+✅ (3) horizons에 과거참조(작년/전년/지난해) 섞이면 즉시 제거/차단
+✅ (4) CLI 자동 detect_horizons + horizon_kind 필터는 유지
+✅ (5) main에서 horizons를 직접 넘겨도 깨지지 않도록 “컬럼 존재 check” 강화
 """
 
 from __future__ import annotations
@@ -36,7 +28,13 @@ from ortools.sat.python import cp_model
 # =========================================================
 
 WEIRD_SPACES = ["\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"]
-PAST_MARKERS = ["작년", "전년", "지난해"]  # ✅ horizon 후보에서 제외해야 하는 과거 참조
+PAST_MARKERS = ["작년", "전년", "지난해"]
+
+HORIZON_KIND_KEYWORDS = {
+    "planned":  ["예정"],   # 예정 수주량
+    "expected": ["예상"],   # 예상 수주량
+    "both":     ["예정", "예상"],
+}
 
 
 def _normalize_col(c: str) -> str:
@@ -52,111 +50,154 @@ def _is_past_ref(col: str) -> bool:
     return any(m in cc for m in PAST_MARKERS)
 
 
-def _sort_horizons_kor(hs: List[str]) -> List[str]:
+def _extract_horizon_index(col: str) -> Optional[int]:
     """
-    한국어 horizon 컬럼까지 안정 정렬:
     - "T일 ..." -> 0
-    - "T+1일 ..." -> 1
+    - "T+3일 ..." -> 3
     - 축약형 "T" -> 0, "T+3" -> 3
-
-    ✅ 같은 horizon에 '예상'과 '예정'이 함께 있을 수 있는데,
-       planner는 보통 D=forecast horizon(0..4)만 쓰는 게 바람직.
-       정렬 자체는 day_idx만 보장하고, 어떤 컬럼을 쓸지는 main에서 필터링하는 것이 가장 안전.
-       (그래도 일단 예상→예정 순서를 주고 싶다면 아래 priority를 추가할 수 있음)
     """
-    def horizon_key(h: str) -> int:
-        s = _normalize_col(h)
+    s = _normalize_col(col)
 
-        # 축약형
-        if s == "T":
-            return 0
-        m0 = re.fullmatch(r"T\+(\d+)", s)
-        if m0:
-            return int(m0.group(1))
+    if s == "T":
+        return 0
+    m0 = re.fullmatch(r"T\+(\d+)", s)
+    if m0:
+        return int(m0.group(1))
 
-        # 한국어 풀네임
-        if s.startswith("T일"):
-            return 0
-        m = re.search(r"T\+(\d+)", s)
-        if m:
-            return int(m.group(1))
+    if s.startswith("T일"):
+        return 0
 
-        # 혹시 "T+3일"처럼 붙어있어도 잡힘
-        m2 = re.search(r"T\+(\d+)\s*일", s)
-        if m2:
-            return int(m2.group(1))
+    m = re.search(r"T\+(\d+)", s)
+    if m:
+        return int(m.group(1))
 
-        return 10_000
-
-    def within_key(h: str) -> int:
-        # 같은 day_idx 내 '예상' 먼저, '예정' 다음 (선호)
-        s = _normalize_col(h)
-        if "예상" in s:
-            return 0
-        if "예정" in s:
-            return 1
-        return 9
-
-    # 중복 제거 + 안정 정렬
-    hs_u = list(dict.fromkeys(hs))
-    return sorted(hs_u, key=lambda x: (horizon_key(x), within_key(x), _normalize_col(x)))
+    return None
 
 
-def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_col: str = "DateTime") -> pd.DataFrame:
+def _within_key(h: str) -> int:
+    """같은 day 내 우선순위: 예정(0) -> 예상(1)"""
+    s = _normalize_col(h)
+    if "예정" in s:
+        return 0
+    if "예상" in s:
+        return 1
+    return 9
+
+
+def _sort_horizons_kor(hs: List[str]) -> List[str]:
+    """day_idx 기준 + 같은 day 내 예정→예상 우선"""
+    def hkey(x: str) -> int:
+        hx = _extract_horizon_index(x)
+        return hx if hx is not None else 10_000
+
+    hs_u = list(dict.fromkeys([_normalize_col(x) for x in hs if x is not None]))
+    return sorted(hs_u, key=lambda x: (hkey(x), _within_key(x), x))
+
+
+def _filter_horizons_by_kind(cols: List[str], kind: str = "planned") -> List[str]:
+    """
+    kind에 맞는 horizon만 남김.
+    - planned: "예정" 포함
+    - expected: "예상" 포함
+    - both: 둘 다 허용하되 같은 day에 둘 다 있으면 예정만 남김
+    """
+    kind = str(kind).lower().strip()
+    if kind not in HORIZON_KIND_KEYWORDS:
+        raise ValueError(f"invalid --horizon_kind={kind}. choose from {list(HORIZON_KIND_KEYWORDS.keys())}")
+
+    cols_n = [_normalize_col(c) for c in cols if c is not None]
+
+    keys = HORIZON_KIND_KEYWORDS[kind]
+    keep = []
+    for c in cols_n:
+        if _is_past_ref(c):
+            continue
+        if any(k in c for k in keys):
+            keep.append(c)
+
+    keep = _sort_horizons_kor(keep)
+
+    if kind == "both":
+        by_day: Dict[int, List[str]] = {}
+        for c in keep:
+            h = _extract_horizon_index(c)
+            if h is None:
+                continue
+            by_day.setdefault(h, []).append(c)
+
+        out = []
+        for h in sorted(by_day.keys()):
+            day_cols = _sort_horizons_kor(by_day[h])
+            chosen = None
+            for cc in day_cols:
+                if "예정" in cc:
+                    chosen = cc
+                    break
+            if chosen is None:
+                chosen = day_cols[0]
+            out.append(chosen)
+        return out
+
+    return keep
+
+
+def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_col: Optional[str] = "DateTime") -> pd.DataFrame:
     """
     - 컬럼 normalize
-    - DateTime이 있으면 제품별 최신 스냅샷으로 축약
-    - DateTime이 없으면 그대로(이미 product-level이면 OK)
+    - dt_col이 실제로 존재하면 product별 최신 스냅샷으로 축약
+    - dt_col이 없으면 그대로(이미 product-level이면 OK)
     """
     df = df.copy()
     df.columns = [_normalize_col(c) for c in df.columns]
 
-    if prod_col not in df.columns:
+    prod_col_n = _normalize_col(prod_col)
+    if prod_col_n not in df.columns:
         raise KeyError(f"'{prod_col}' 컬럼이 없습니다. 현재 컬럼: {list(df.columns)}")
 
-    if dt_col not in df.columns:
+    if not dt_col:
         return df
 
-    df[dt_col] = pd.to_datetime(df[dt_col], errors="coerce")
-    valid = df.dropna(subset=[dt_col])
+    dt_col_n = _normalize_col(dt_col)
+    if dt_col_n not in df.columns:
+        return df
+
+    df[dt_col_n] = pd.to_datetime(df[dt_col_n], errors="coerce")
+    valid = df.dropna(subset=[dt_col_n])
     if valid.empty:
-        return df.drop(columns=[dt_col], errors="ignore")
+        return df.drop(columns=[dt_col_n], errors="ignore")
 
     latest_dt = (
-        valid.groupby(prod_col, as_index=False)[dt_col].max()
-             .rename(columns={dt_col: "_LatestDT"})
+        valid.groupby(prod_col_n, as_index=False)[dt_col_n].max()
+             .rename(columns={dt_col_n: "_LatestDT"})
     )
-    merged = df.merge(latest_dt, on=prod_col, how="inner")
-    picked = merged[merged[dt_col] == merged["_LatestDT"]].copy()
+    merged = df.merge(latest_dt, on=prod_col_n, how="inner")
+    picked = merged[merged[dt_col_n] == merged["_LatestDT"]].copy()
 
+    # 숫자형은 mean, 나머지는 first
     num_cols = picked.select_dtypes(include="number").columns.tolist()
     non_num_cols = [c for c in picked.columns if c not in num_cols]
 
-    # num mean / others first
     agg = {**{c: "first" for c in non_num_cols}, **{c: "mean" for c in num_cols}}
-    snapped = picked.groupby(prod_col, as_index=False).agg(agg)
-    return snapped.drop(columns=["_LatestDT", dt_col], errors="ignore")
+    snapped = picked.groupby(prod_col_n, as_index=False).agg(agg)
+    return snapped.drop(columns=["_LatestDT", dt_col_n], errors="ignore")
 
 
 def load_cluster_info(feat_file: str, prod_col: str = "Product_Number") -> Dict[str, int]:
-    """
-    feat.csv에서 제품별 Cluster 매핑 로드.
-    - Cluster 없으면 전체 1로 처리(안전)
-    """
     df = pd.read_csv(feat_file)
     df.columns = [_normalize_col(c) for c in df.columns]
 
-    if prod_col not in df.columns:
+    prod_col_n = _normalize_col(prod_col)
+    if prod_col_n not in df.columns:
         raise ValueError(f"feat.csv에는 '{prod_col}' 컬럼이 필요합니다.")
 
     if "Cluster" not in df.columns:
         print("[WARN] feat.csv에 'Cluster' 컬럼이 없습니다. 모든 제품을 Cluster=1로 처리합니다.")
-        return {str(p): 1 for p in df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()}
+        return {str(p): 1 for p in df[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True).unique().tolist()}
 
-    m = df[[prod_col, "Cluster"]].drop_duplicates()
-    m[prod_col] = m[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    m = df[[prod_col_n, "Cluster"]].drop_duplicates()
+    m[prod_col_n] = m[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
     m["Cluster"] = pd.to_numeric(m["Cluster"], errors="coerce").fillna(1).astype(int)
-    return m.set_index(prod_col)["Cluster"].to_dict()
+    return m.set_index(prod_col_n)["Cluster"].to_dict()
 
 
 # =========================================================
@@ -164,21 +205,21 @@ def load_cluster_info(feat_file: str, prod_col: str = "Product_Number") -> Dict[
 # =========================================================
 
 def load_hint_plan_csv(path: str, scale: int = 10, prod_col: str = "Product_Number") -> Dict[Tuple[str, int], int]:
-    """
-    hint plan CSV -> {(prod_col, day_idx): produce_int_scaled}
-    """
     df = pd.read_csv(path)
-    need = {prod_col, "day_idx", "produce"}
+    prod_col_n = _normalize_col(prod_col)
+    df.columns = [_normalize_col(c) for c in df.columns]
+
+    need = {prod_col_n, "day_idx", "produce"}
     if not need.issubset(df.columns):
         raise ValueError(f"hint_plan_csv에는 {sorted(need)} 컬럼이 필요합니다. 현재={list(df.columns)}")
 
-    df[prod_col] = df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    df[prod_col_n] = df[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
     df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
     df["produce"] = pd.to_numeric(df["produce"], errors="coerce").fillna(0.0)
 
     m: Dict[Tuple[str, int], int] = {}
     for r in df.itertuples(index=False):
-        p = str(getattr(r, prod_col))
+        p = str(getattr(r, prod_col_n))
         d = int(r.day_idx)
         v = int(round(float(r.produce) * scale))
         if v < 0:
@@ -188,7 +229,7 @@ def load_hint_plan_csv(path: str, scale: int = 10, prod_col: str = "Product_Numb
 
 
 # =========================================================
-# (A-2) MC loader (raw scenarios)
+# (A-2) MC loader
 # =========================================================
 
 def load_mc_scenarios(
@@ -197,6 +238,8 @@ def load_mc_scenarios(
     product_col: str = "Product_Number",
 ) -> Tuple[Optional[np.ndarray], Optional[List[str]]]:
     """CVaR용 raw scenarios 반환 (S,P,D), products list"""
+    product_col_n = _normalize_col(product_col)
+
     if mc_npz and os.path.exists(mc_npz):
         z = np.load(mc_npz, allow_pickle=True)
 
@@ -221,19 +264,20 @@ def load_mc_scenarios(
 
     if mc_csv and os.path.exists(mc_csv):
         df = pd.read_csv(mc_csv)
+        df.columns = [_normalize_col(c) for c in df.columns]
 
-        need = {"scenario_id", "day_idx", product_col, "demand"}
+        need = {"scenario_id", "day_idx", product_col_n, "demand"}
         if not need.issubset(df.columns):
             raise ValueError(f"mc_csv에는 {sorted(need)} 컬럼이 필요합니다. 현재={list(df.columns)}")
 
         df["scenario_id"] = pd.to_numeric(df["scenario_id"], errors="coerce").fillna(0).astype(int)
         df["day_idx"] = pd.to_numeric(df["day_idx"], errors="coerce").fillna(0).astype(int)
-        df[product_col] = df[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+        df[product_col_n] = df[product_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
         df["demand"] = pd.to_numeric(df["demand"], errors="coerce").fillna(0.0)
 
         S = int(df["scenario_id"].max()) + 1
         D = int(df["day_idx"].max()) + 1
-        products = sorted(df[product_col].unique().tolist())
+        products = sorted(df[product_col_n].unique().tolist())
         P = len(products)
         pid = {p: i for i, p in enumerate(products)}
 
@@ -241,7 +285,7 @@ def load_mc_scenarios(
         for r in df.itertuples(index=False):
             s = int(r.scenario_id)
             d = int(r.day_idx)
-            p = str(getattr(r, product_col))
+            p = str(getattr(r, product_col_n))
             scenarios[s, pid[p], d] = float(r.demand)
 
         return scenarios, products
@@ -263,53 +307,51 @@ def reorder_mc_scenarios_to_forecast(
     return out
 
 
-def detect_horizons(df: pd.DataFrame) -> List[str]:
-    """
-    horizon 컬럼 후보를 강건하게 수집하고,
-    ✅ 반드시 _sort_horizons_kor()로 정렬해서 반환.
-
-    ✅ 추가 방어(중요):
-    - '작년/전년/지난해' 포함 컬럼은 horizon 후보에서 제외
-      (forecast 쪽에서 이미 제외해도, planner에서 한번 더 방어해야 E2E에서 안전)
-    """
+def detect_horizons(df: pd.DataFrame, horizon_kind: str = "planned") -> List[str]:
+    """자동 horizon 감지 + kind 필터 + 정렬"""
     candidates: List[str] = []
+    cols = list(df.columns)
 
-    def _ok(c: str) -> bool:
+    def ok(c: str) -> bool:
         cc = _normalize_col(c)
-        if _is_past_ref(cc):        # ✅ 과거 참조는 horizon 후보에서 제외
+        if _is_past_ref(cc):
             return False
         return True
 
-    # 1) 축약형: "T", "T+1" ...
-    for c in df.columns:
+    # 1) 축약형 "T", "T+1"
+    for c in cols:
         cc = _normalize_col(c)
-        if not _ok(c):
+        if not ok(c):
             continue
         if re.fullmatch(r"T(\+\d+)?", cc):
-            candidates.append(c)
+            candidates.append(cc)
 
-    # 2) 한국어 풀네임: "T일 예상/예정 수주량", "T+3일 ..." 등
-    rgx_full = re.compile(r"^T(\+\d+)?일\s*(예상|예정)?\s*.*$")  # 예상/예정 없어도 허용
-    for c in df.columns:
+    # 2) "T+1일 예정 수주량" 등
+    rgx_full = re.compile(r"^T(\+\d+)?일\s*(예상|예정)?\s*.*$")
+    for c in cols:
         cc = _normalize_col(c)
-        if not _ok(c):
+        if not ok(c):
             continue
         if rgx_full.match(cc) and ("수주" in cc or "예상" in cc or "예정" in cc):
-            candidates.append(c)
+            candidates.append(cc)
 
-    # 3) 마지막 fallback: "T+숫자"가 포함된 컬럼
-    for c in df.columns:
+    # 3) fallback: "T+숫자"
+    for c in cols:
         cc = _normalize_col(c)
-        if not _ok(c):
+        if not ok(c):
             continue
         if re.search(r"T\+\d+", cc):
-            candidates.append(c)
+            candidates.append(cc)
 
-    candidates = _sort_horizons_kor(list(dict.fromkeys(candidates)))
+    candidates = _sort_horizons_kor(candidates)
+    filtered = _filter_horizons_by_kind(candidates, kind=horizon_kind)
 
-    if not candidates:
-        raise ValueError("horizons 자동 감지 실패. --horizons 로 명시해 주세요.")
-    return candidates
+    if not filtered:
+        raise ValueError(
+            f"horizons 자동 감지 실패. horizon_kind={horizon_kind}. "
+            f"--horizons 로 명시해 주세요."
+        )
+    return filtered
 
 
 # =========================================================
@@ -335,13 +377,7 @@ def _make_2d_bool(model: cp_model.CpModel, P: int, D: int, name: str):
 _INT64_MAX = 9_000_000_000_000_000_000  # 9e18 safety
 
 
-def _make_solver(
-    solver_seed: int,
-    max_time: float,
-    workers: int,
-    gap: float,
-    log_progress: bool,
-) -> cp_model.CpSolver:
+def _make_solver(solver_seed: int, max_time: float, workers: int, gap: float, log_progress: bool) -> cp_model.CpSolver:
     solver = cp_model.CpSolver()
     solver.parameters.relative_gap_limit = float(gap)
     solver.parameters.max_time_in_seconds = float(max_time)
@@ -363,27 +399,22 @@ def optimize_plan(
     daily_capacity: int = 15000,
     lambda_smooth: float = 0.5,
     initial_inventory: float = 0.0,
-    int_production: bool = True,  # CLI 호환 유지
+    int_production: bool = True,
     scale: int = 10,
+    dt_col: Optional[str] = None,  # ✅ 하드코딩 제거 (필요하면 main에서 넘김)
     initial_inventory_map: Optional[Dict[str, float]] = None,
     min_lot_map: Optional[Dict[int, float]] = None,
     safety_stock_map: Optional[Dict[int, float]] = None,
     weight_map: Optional[Dict[int, float]] = None,
-
-    # ---- Warm start ----
     hint_plan: Optional[Dict[Tuple[str, int], int]] = None,
-
-    # ---- CVaR objective ----
     use_cvar_obj: bool = False,
-    mc_scenarios: Optional[np.ndarray] = None,     # (S,P,D) in forecast product order
+    mc_scenarios: Optional[np.ndarray] = None,     # (S,P,D)
     cvar_alpha: float = 0.9,
     lambda_cvar: float = 0.3,
     lambda_scale: int = 100_000_000,
     mc_wb: float = 1.0,
     mc_wi: float = 0.2,
     loss_scale: int = 100_000,
-
-    # ---- solver controls ----
     solver_seed: int = 42,
     max_time: float = 300.0,
     workers: int = 1,
@@ -395,18 +426,32 @@ def optimize_plan(
     safety_stock_map = safety_stock_map or {0: 0, 1: 0, 2: 0, 3: 0}
     weight_map = weight_map or {0: 5.0, 1: 2.0, 2: 0.5, 3: 1.0}
 
-    df = preprocess_forecast(forecast_by_product, prod_col=prod_col, dt_col="DateTime")
-    df[prod_col] = df[prod_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    # ✅ preprocess: normalize + (dt_col 있으면 snapshot)
+    df = preprocess_forecast(forecast_by_product, prod_col=prod_col, dt_col=dt_col)
+    prod_col_n = _normalize_col(prod_col)
 
-    products = df[prod_col].tolist()
-    P, D = len(products), len(horizons)
+    df[prod_col_n] = df[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
 
-    demand_f = df[horizons].to_numpy(dtype=float)
+    # ✅ horizons normalize + past-ref 제거 + 정렬 강제
+    hz = [_normalize_col(h) for h in horizons if h is not None]
+    hz = [h for h in hz if not _is_past_ref(h)]
+    hz = _sort_horizons_kor(hz)
+
+    if not hz:
+        raise ValueError("horizons is empty after normalization/past-ref filtering.")
+
+    # ✅ horizons 컬럼 존재 확인
+    missing = [h for h in hz if h not in df.columns]
+    if missing:
+        raise KeyError(f"horizon columns missing in forecast input: {missing}\navailable={list(df.columns)}")
+
+    products = df[prod_col_n].tolist()
+    P, D = len(products), len(hz)
+
+    demand_f = df[hz].to_numpy(dtype=float)
     demand_i = np.rint(np.maximum(demand_f, 0.0) * scale).astype(int)  # (P,D)
 
     day_cap = int(daily_capacity * scale)
-
-    # UB 타이트닝
     PROD_UB = day_cap
     DIFF_UB = day_cap
 
@@ -497,7 +542,7 @@ def optimize_plan(
             raise RuntimeError(f"OR-Tools: {solver.StatusName(status)} (실행 가능한 계획 실패)")
 
         rows = []
-        for d_in, hcol in enumerate(horizons):
+        for d_in, hcol in enumerate(hz):
             for i, p in enumerate(products):
                 rows.append({
                     "day_idx": int(d_in),
@@ -516,11 +561,12 @@ def optimize_plan(
             "STATE_UB": int(STATE_UB),
             "PROD_UB": int(PROD_UB),
             "smooth_w": int(smooth_w),
+            "note": "day_idx=0 corresponds to the first horizon column in `horizons`.",
         }
         return plan_df, diag
 
     # =====================================================
-    # CVaR MODE (ShortageRate 기반, evaluator와 정합)
+    # CVaR MODE
     # =====================================================
     if mc_scenarios is None:
         raise ValueError("use_cvar_obj=True 인데 mc_scenarios가 없습니다. (S,P,D) 시나리오 텐서를 넘겨주세요.")
@@ -539,7 +585,6 @@ def optimize_plan(
 
     mc_demand_i = np.rint(np.maximum(mc_scenarios, 0.0) * scale).astype(int)  # (S,P,D)
 
-    # UB: 시나리오 누적수요 최댓값 기반(타이트)
     cum_dem_max = np.cumsum(mc_demand_i, axis=2).max(axis=0)  # (P,D)
     STATE_UB = _safe_int_cap(int(cum_dem_max.max() * 2))
 
@@ -593,10 +638,8 @@ def optimize_plan(
         model.Add(total_short_s[s] == sum(shortage_s[s][i][d] for i in range(P) for d in range(D)))
         model.Add(sum_inv_s[s]     == sum(inv_s[s][i][d]      for i in range(P) for d in range(D)))
 
-    # =====================================================
-    # Rate-based loss (evaluator와 1:1 일치)
-    # =====================================================
-    total_dem_i = mc_demand_i.sum(axis=(1, 2)).astype(int)  # (S,)
+    # ---- Rate-based loss (evaluator와 같은 철학) ----
+    total_dem_i = mc_demand_i.sum(axis=(1, 2)).astype(int)
     total_dem_i = np.maximum(total_dem_i, 1)
 
     denom_inv = int(max(P * D * day_cap, 1))
@@ -622,7 +665,7 @@ def optimize_plan(
         model.Add(weighted_sum_s[s] == wb_w * short_rate_int[s] + wi_w * inv_rate_int[s])
         model.AddDivisionEquality(loss_int_s[s], weighted_sum_s[s], WDEN)
 
-    # ---- CVaR linearization on loss_int_s ----
+    # ---- CVaR linearization ----
     a = float(cvar_alpha)
     a = min(max(a, 0.0), 0.999999)
 
@@ -662,7 +705,6 @@ def optimize_plan(
                 model.Add(diff >= produce[i][d-1] - produce[i][d])
                 base_terms.append(smooth_w * diff)
 
-    # ---- objective ----
     lam_int = int(round(float(lambda_cvar) * int(lambda_scale)))
     lam_int = max(lam_int, 0)
 
@@ -679,7 +721,7 @@ def optimize_plan(
     demand_mean = mc_scenarios.mean(axis=0)  # (P,D)
 
     rows = []
-    for d_in, hcol in enumerate(horizons):
+    for d_in, hcol in enumerate(hz):
         for i, p in enumerate(products):
             inv_mean  = float(np.mean([solver.Value(inv_s[s][i][d_in]) for s in range(S)]) / scale)
             back_mean = float(np.mean([solver.Value(backlog_s[s][i][d_in]) for s in range(S)]) / scale)
@@ -717,7 +759,7 @@ def optimize_plan(
         "smooth_w": int(smooth_w),
         "wb_w": int(wb_w),
         "wi_w": int(wi_w),
-        "note": "rate-based loss: wb*ShortageRate + wi*InventoryRate (matches evaluator)",
+        "note": "rate-based loss: wb*ShortageRate + wi*InventoryRate. day_idx=0 is the first horizon column.",
     }
     print("[CVaR]", diag)
     return plan_df, diag
@@ -768,6 +810,7 @@ def _run_optimize_with_fallbacks(
                 initial_inventory=args.initial_inventory,
                 int_production=args.int_production,
                 scale=args.scale,
+                dt_col=args.dt_col,
                 min_lot_map=_load_map_json_or_file(args.min_lot_map),
                 safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
                 weight_map=_load_map_json_or_file(args.weight_map),
@@ -809,6 +852,9 @@ def main():
     ap.add_argument("--out_csv", required=True)
 
     ap.add_argument("--product_col", default="Product_Number")
+    ap.add_argument("--dt_col", default="DateTime")  # ✅ 하드코딩 제거: CLI로 받음
+
+    ap.add_argument("--horizon_kind", default="planned", choices=["planned", "expected", "both"])
     ap.add_argument("--horizons", nargs="*", default=None)
 
     ap.add_argument("--daily_capacity", type=int, default=15000)
@@ -816,15 +862,14 @@ def main():
     ap.add_argument("--initial_inventory", type=float, default=0.0)
 
     ap.add_argument("--scale", type=int, default=10)
-
     ap.add_argument("--int_production", action="store_true")
+
     ap.add_argument("--min_lot_map", type=str, default=None)
     ap.add_argument("--safety_stock_map", type=str, default=None)
     ap.add_argument("--weight_map", type=str, default=None)
     ap.add_argument("--initial_inventory_map", type=str, default=None)
 
-    # Warm-start
-    ap.add_argument("--hint_plan_csv", type=str, default=None, help="Warm-start hint plan CSV (prod_col, day_idx, produce)")
+    ap.add_argument("--hint_plan_csv", type=str, default=None)
 
     ap.add_argument("--solver_seed", type=int, default=42)
     ap.add_argument("--max_time", type=float, default=300.0)
@@ -848,9 +893,21 @@ def main():
     pred = pd.read_csv(args.in_csv)
     cluster_info = load_cluster_info(args.feat_csv, prod_col=args.product_col)
 
-    forecast_df = preprocess_forecast(pred, prod_col=args.product_col, dt_col="DateTime")
-    horizons = args.horizons or detect_horizons(forecast_df)
-    horizons = _sort_horizons_kor(horizons)  # ✅ 최종 안전 정렬
+    forecast_df = preprocess_forecast(pred, prod_col=args.product_col, dt_col=args.dt_col)
+
+    # horizons 결정
+    if args.horizons:
+        h_raw = [_normalize_col(h) for h in args.horizons]
+        h_raw = [h for h in h_raw if not _is_past_ref(h)]
+        h_raw = _sort_horizons_kor(h_raw)
+        horizons = _filter_horizons_by_kind(h_raw, kind=args.horizon_kind)
+        if not horizons:
+            raise ValueError(f"--horizons를 줬지만 horizon_kind={args.horizon_kind}로 필터 후 남는 게 없습니다.")
+    else:
+        horizons = detect_horizons(forecast_df, horizon_kind=args.horizon_kind)
+
+    horizons = _sort_horizons_kor(horizons)
+    print(f"[INFO] horizon_kind={args.horizon_kind} | D={len(horizons)} | horizons={horizons}")
 
     inv_map_raw = _load_map_json_or_file(args.initial_inventory_map)
     inv_map: Dict[str, float] = inv_map_raw or {}
@@ -871,6 +928,7 @@ def main():
             initial_inventory=args.initial_inventory,
             int_production=args.int_production,
             scale=args.scale,
+            dt_col=None,  # 이미 forecast_df는 스냅샷일 가능성이 높음
             min_lot_map=_load_map_json_or_file(args.min_lot_map),
             safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
             weight_map=_load_map_json_or_file(args.weight_map),
@@ -892,11 +950,12 @@ def main():
     if scenarios is None or mc_products is None:
         raise ValueError("--use_cvar_obj 사용 시 --mc_npz 또는 --mc_csv 필요")
 
-    forecast_df[args.product_col] = forecast_df[args.product_col].astype(str).str.replace(r"\.0$", "", regex=True)
-    forecast_products = forecast_df[args.product_col].tolist()
+    prod_col_n = _normalize_col(args.product_col)
+    forecast_df[prod_col_n] = forecast_df[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
+    forecast_products = forecast_df[prod_col_n].tolist()
     scenarios_re = reorder_mc_scenarios_to_forecast(scenarios, mc_products, forecast_products)
 
-    plan_df, diag, used_loss_scale = _run_optimize_with_fallbacks(
+    plan_df, diag, _used_loss_scale = _run_optimize_with_fallbacks(
         forecast_df=forecast_df,
         horizons=horizons,
         args=args,

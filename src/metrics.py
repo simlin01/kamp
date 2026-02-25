@@ -14,13 +14,16 @@ Metrics utilities for SCM pipeline:
   ShortageRate  = TotalShortage / TotalDemand
   FillRate      = 1 - ShortageRate
 
-[이번 수정 핵심]
-1) Forecast metrics wide-form에서 horizons 자동탐지(미지정 시) 지원
-2) Plan 컬럼 표준화 강화: shortage 컬럼이 있으면 backlog 없이도 service 계산 가능
-3) CVaR mean plan(시나리오 평균 plan)에서 FillRate 왜곡 방지:
-   - shortage 컬럼이 있으면 backlog diff로 다시 계산하지 말고 shortage를 우선 사용
+[이번 수정 핵심: forecast.py/planner_opt.py 변경 반영]
+1) Forecast wide-form horizons 자동탐지 시:
+   - '작년/전년/지난해' 과거 참조 컬럼은 무조건 제외
+   - horizon_kind(planned/expected/both) 필터 지원 (기본 planned 권장)
+   - 같은 horizon에 planned+expected가 섞여 있어도 planned 우선 선택 가능
+2) Plan 컬럼 표준화 강화: shortage 컬럼이 있으면 backlog 없이도 service 계산 가능(기존 유지)
+3) CVaR mean plan에서 FillRate 왜곡 방지(기존 유지):
+   - shortage 컬럼이 있으면 backlog diff로 재계산하지 않고 shortage를 우선 사용
    - shortage 합산은 항상 (product, day) 단위로 집계 후 총합으로 계산
-4) Cluster KPI 계산 안전화
+4) Cluster KPI 계산 안전화(기존 유지)
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ import numpy as np
 import pandas as pd
 
 _EPS = 1e-9
+PAST_MARKERS = ["작년", "전년", "지난해"]
 
 
 # ---------------------------
@@ -98,7 +102,11 @@ def _align_wide(
     p = pred_df[[product_col] + horizons].copy()
     a = actuals_df[[product_col] + horizons].copy()
 
-    common = p.merge(a[[product_col]], on=product_col, how="inner")[product_col]
+    # normalize product ids
+    p[product_col] = p[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    a[product_col] = a[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+
+    common = sorted(set(p[product_col]).intersection(set(a[product_col])))
     p = p[p[product_col].isin(common)].sort_values(product_col)
     a = a[a[product_col].isin(common)].sort_values(product_col)
 
@@ -122,6 +130,10 @@ def _align_long(
     pred_col = next(c for c in ["y_hat", "y_pred", "pred"] if c in p.columns)
     act_col = next(c for c in ["y_actual", "actual"] if c in a.columns)
 
+    # normalize product ids
+    p[product_col] = p[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+    a[product_col] = a[product_col].astype(str).str.replace(r"\.0$", "", regex=True)
+
     m = p[[product_col, "__Date__", pred_col]].merge(
         a[[product_col, "__Date__", act_col]],
         on=[product_col, "__Date__"],
@@ -135,6 +147,11 @@ def _align_long(
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s)).strip()
+
+
+def _is_past_ref(col: str) -> bool:
+    cc = _norm(col)
+    return any(m in cc for m in PAST_MARKERS)
 
 
 def _extract_horizon_index(col: str) -> Optional[int]:
@@ -155,31 +172,124 @@ def _extract_horizon_index(col: str) -> Optional[int]:
     return None
 
 
-def detect_horizons_from_df(df: pd.DataFrame, product_col: str) -> List[str]:
+def _within_key(col: str) -> int:
+    """
+    같은 horizon 내 우선순위:
+    - 예정(planned) 먼저
+    - 예상(expected) 다음
+    """
+    c = _norm(col)
+    if "예정" in c:
+        return 0
+    if "예상" in c:
+        return 1
+    return 9
+
+
+def _filter_horizons_by_kind(cols: List[str], horizon_kind: str) -> List[str]:
+    """
+    forecast.py 변경 반영:
+    - 기본 planned(예정)만 평가하는 것이 일반적으로 맞음(=y 타깃)
+    - both는 허용하되, 같은 horizon에 planned+expected가 있으면 planned만 남김(안전)
+    """
+    hk = str(horizon_kind).lower().strip()
+    if hk not in ("planned", "expected", "both"):
+        raise ValueError("--horizon_kind must be one of: planned, expected, both")
+
+    cols = [_norm(c) for c in cols]
+    cols = [c for c in cols if c and (not _is_past_ref(c))]
+
+    def is_planned(c: str) -> bool:
+        return "예정" in c
+
+    def is_expected(c: str) -> bool:
+        return "예상" in c
+
+    if hk == "planned":
+        return [c for c in cols if is_planned(c)]
+    if hk == "expected":
+        return [c for c in cols if is_expected(c)]
+
+    # both: day별로 하나만(예정 우선)
+    by_h: Dict[int, List[str]] = {}
+    for c in cols:
+        h = _extract_horizon_index(c)
+        if h is None:
+            continue
+        if ("예정" in c) or ("예상" in c):
+            by_h.setdefault(h, []).append(c)
+
+    out: List[str] = []
+    for h in sorted(by_h.keys()):
+        day_cols = sorted(by_h[h], key=lambda x: (_within_key(x), x))
+        chosen = None
+        for cc in day_cols:
+            if "예정" in cc:
+                chosen = cc
+                break
+        if chosen is None:
+            chosen = day_cols[0]
+        out.append(chosen)
+    return out
+
+
+def detect_horizons_from_df(
+    df: pd.DataFrame,
+    product_col: str,
+    horizon_kind: str = "planned",
+) -> List[str]:
+    """
+    wide-form forecast metrics를 위한 horizon 컬럼 자동 탐지.
+    ✅ 변경점:
+    - 과거참조(작년/전년/지난해) 컬럼은 무조건 제외
+    - horizon_kind 필터(기본 planned)
+    - 같은 horizon에 planned+expected가 있으면 planned 우선 선택 가능(both일 때)
+    """
     cands: List[str] = []
     for c in df.columns:
         if c == product_col:
             continue
         cc = _norm(c)
-        if ("예상" in cc or "예정" in cc or "수주" in cc) and (("T일" in cc) or ("T+" in cc)):
-            cands.append(c)
-        elif re.fullmatch(r"T(\+\d+)?", cc):
-            cands.append(c)
-        elif re.search(r"T\+\d+", cc):
-            cands.append(c)
+        if _is_past_ref(cc):
+            continue
 
-    with_h = []
-    no_h = []
+        # 한국어 기반
+        if (("예상" in cc) or ("예정" in cc) or ("수주" in cc)) and (("T일" in cc) or ("T+" in cc)):
+            cands.append(c)
+            continue
+
+        # 축약형 / 포함형
+        if re.fullmatch(r"T(\+\d+)?", cc):
+            cands.append(c)
+            continue
+        if re.search(r"T\+\d+", cc):
+            cands.append(c)
+            continue
+
+    # horizon index로 정렬
+    with_h: List[Tuple[int, str]] = []
+    no_h: List[str] = []
     for c in cands:
         h = _extract_horizon_index(c)
         if h is not None:
             with_h.append((h, c))
         else:
-            no_h.append((None, c))
+            no_h.append(c)
 
-    out = [c for _, c in sorted(with_h, key=lambda x: x[0])] + [c for _, c in no_h]
-    out = list(dict.fromkeys(out))
-    return out
+    # 같은 horizon 내 planned→expected 우선(정렬 안정화)
+    with_h_sorted = sorted(with_h, key=lambda x: (x[0], _within_key(x[1]), _norm(x[1])))
+    ordered = [c for _, c in with_h_sorted] + [c for c in no_h]
+    ordered = list(dict.fromkeys(ordered))
+
+    # kind 필터
+    filtered = _filter_horizons_by_kind(ordered, horizon_kind=horizon_kind)
+
+    # kind 필터 결과가 비면, fallback으로 "kind 무시"하고라도 반환(단, 비과거만)
+    if not filtered:
+        # 그래도 최소한 과거는 제외된 ordered를 반환
+        return ordered
+
+    return filtered
 
 
 def compute_forecast_metrics(
@@ -187,12 +297,17 @@ def compute_forecast_metrics(
     actuals_df: pd.DataFrame,
     horizons: Optional[List[str]],
     product_col: str,
+    horizon_kind: str = "planned",
 ) -> Dict[str, float]:
+    """
+    - long-form이면 horizon 개념 없이 (product, date) join 후 평가
+    - wide-form이면 horizons가 없을 때 자동탐지 + horizon_kind 필터 적용
+    """
     if _detect_long_form(pred_df) and _detect_long_form(actuals_df):
         yhat, y = _align_long(pred_df, actuals_df, product_col)
     else:
         if not horizons:
-            horizons = detect_horizons_from_df(pred_df, product_col=product_col)
+            horizons = detect_horizons_from_df(pred_df, product_col=product_col, horizon_kind=horizon_kind)
         if not horizons:
             raise ValueError("horizons required for wide-vs-wide evaluation (auto-detect failed)")
         yhat, y = _align_wide(pred_df, actuals_df, product_col, horizons)
@@ -233,7 +348,7 @@ def _ensure_plan_cols(df: pd.DataFrame, product_col: str) -> pd.DataFrame:
 
     # optional columns
     if "backlog" not in df.columns:
-        df["backlog"] = np.nan  # 없다는 정보를 유지
+        df["backlog"] = np.nan
     if "shortage" not in df.columns:
         df["shortage"] = np.nan
     if "end_inventory" not in df.columns:
@@ -248,10 +363,6 @@ def _ensure_plan_cols(df: pd.DataFrame, product_col: str) -> pd.DataFrame:
 
 
 def _compute_shortage_from_backlog(df: pd.DataFrame, product_col: str) -> float:
-    """
-    backlog가 있을 때 shortage = backlog 증가분.
-    반환: total_shortage (float)
-    """
     g = (
         df.groupby([product_col, "day_idx"], dropna=False, as_index=False)["backlog"]
           .sum(numeric_only=True)
@@ -263,11 +374,6 @@ def _compute_shortage_from_backlog(df: pd.DataFrame, product_col: str) -> float:
 
 
 def _compute_shortage_from_shortage_col(df: pd.DataFrame, product_col: str) -> float:
-    """
-    shortage 컬럼이 이미 plan_df에 있을 때(CVaR mean plan 등).
-    (product, day) 중복이 있을 수 있으니 합친 뒤 총합.
-    반환: total_shortage (float)
-    """
     g = (
         df.groupby([product_col, "day_idx"], dropna=False, as_index=False)["shortage"]
           .sum(numeric_only=True)
@@ -296,11 +402,9 @@ def compute_planning_metrics(
     df["produce"] = df["produce"].fillna(0.0)
     df["end_inventory"] = df["end_inventory"].fillna(0.0)
 
-    # backlog/shortage는 없을 수도 있으므로 그대로 둠(na 유지)
     total_demand = float(df["demand"].sum())
     total_produce = float(df["produce"].sum())
 
-    # reference only (level-based)
     backlog_level_total = float(df["backlog"].fillna(0.0).sum())
 
     # ✅ service metrics
@@ -310,7 +414,6 @@ def compute_planning_metrics(
         if df["backlog"].notna().any():
             total_shortage = _compute_shortage_from_backlog(df.fillna({"backlog": 0.0}), product_col=product_col)
         else:
-            # shortage도 backlog도 없으면 service를 계산할 근거가 없음 → 0으로 두되 표시
             total_shortage = 0.0
 
     shortage_rate = float(total_shortage / (total_demand + _EPS))
@@ -374,7 +477,6 @@ def compute_planning_metrics(
                          .groupby("Cluster")["shortage"].sum(numeric_only=True)
                     )
                 else:
-                    # backlog diff within cluster/product
                     g2 = (
                         m.fillna({"backlog": 0.0})
                          .groupby(["Cluster", product_col, "day_idx"], as_index=False)["backlog"].sum()
@@ -413,7 +515,12 @@ if __name__ == "__main__":
     parser.add_argument("--plan_csv", type=str)
     parser.add_argument("--feat_csv", type=str)
     parser.add_argument("--product_col", type=str, default="Product_Number")
+
+    # ✅ forecast.py/planner_opt.py 변경 반영: default planned
+    parser.add_argument("--horizon_kind", type=str, default="planned", choices=["planned", "expected", "both"],
+                        help="Wide-form forecast evaluation에서 자동탐지 시 사용할 horizon 종류. 기본 planned 권장.")
     parser.add_argument("--horizons", nargs="*", default=None)
+
     parser.add_argument("--daily_capacity", type=float, default=10000)
     parser.add_argument("--out_json", type=str, default=None)
 
@@ -429,12 +536,25 @@ if __name__ == "__main__":
     if args.pred_csv and args.actuals_csv:
         pred = pd.read_csv(args.pred_csv)
         act = pd.read_csv(args.actuals_csv)
-        results["Forecast"] = compute_forecast_metrics(pred, act, args.horizons, args.product_col)
+
+        horizons = args.horizons if args.horizons else None
+        results["Forecast"] = compute_forecast_metrics(
+            pred_df=pred,
+            actuals_df=act,
+            horizons=horizons,
+            product_col=args.product_col,
+            horizon_kind=args.horizon_kind,
+        )
 
     if args.plan_csv:
         plan = pd.read_csv(args.plan_csv)
         feat = pd.read_csv(args.feat_csv) if args.feat_csv else None
-        results["Planning"] = compute_planning_metrics(plan, args.daily_capacity, feat_df=feat, product_col=args.product_col)
+        results["Planning"] = compute_planning_metrics(
+            plan_df=plan,
+            daily_capacity=args.daily_capacity,
+            feat_df=feat,
+            product_col=args.product_col,
+        )
 
     for sec, metrics in results.items():
         print(f"\n[{sec} metrics]")
