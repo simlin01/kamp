@@ -10,6 +10,11 @@ planner_opt.py — CP-SAT 생산계획 (CVaR objective)
 ✅ (3) horizons에 과거참조(작년/전년/지난해) 섞이면 즉시 제거/차단
 ✅ (4) CLI 자동 detect_horizons + horizon_kind 필터는 유지
 ✅ (5) main에서 horizons를 직접 넘겨도 깨지지 않도록 “컬럼 존재 check” 강화
+
+[이번 패치 핵심]
+✅ (6) CVaR loss에 weight_map(클러스터 가중치) 실제 반영
+    - shortage / inventory aggregate를 cluster weight로 가중합
+    - rate 계산 시 분모에 W_SCALE을 포함해 스케일 복원
 """
 
 from __future__ import annotations
@@ -173,7 +178,6 @@ def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_c
     merged = df.merge(latest_dt, on=prod_col_n, how="inner")
     picked = merged[merged[dt_col_n] == merged["_LatestDT"]].copy()
 
-    # 숫자형은 mean, 나머지는 first
     num_cols = picked.select_dtypes(include="number").columns.tolist()
     non_num_cols = [c for c in picked.columns if c not in num_cols]
 
@@ -318,7 +322,6 @@ def detect_horizons(df: pd.DataFrame, horizon_kind: str = "planned") -> List[str
             return False
         return True
 
-    # 1) 축약형 "T", "T+1"
     for c in cols:
         cc = _normalize_col(c)
         if not ok(c):
@@ -326,7 +329,6 @@ def detect_horizons(df: pd.DataFrame, horizon_kind: str = "planned") -> List[str
         if re.fullmatch(r"T(\+\d+)?", cc):
             candidates.append(cc)
 
-    # 2) "T+1일 예정 수주량" 등
     rgx_full = re.compile(r"^T(\+\d+)?일\s*(예상|예정)?\s*.*$")
     for c in cols:
         cc = _normalize_col(c)
@@ -335,7 +337,6 @@ def detect_horizons(df: pd.DataFrame, horizon_kind: str = "planned") -> List[str
         if rgx_full.match(cc) and ("수주" in cc or "예상" in cc or "예정" in cc):
             candidates.append(cc)
 
-    # 3) fallback: "T+숫자"
     for c in cols:
         cc = _normalize_col(c)
         if not ok(c):
@@ -401,7 +402,7 @@ def optimize_plan(
     initial_inventory: float = 0.0,
     int_production: bool = True,
     scale: int = 10,
-    dt_col: Optional[str] = None,  # ✅ 하드코딩 제거 (필요하면 main에서 넘김)
+    dt_col: Optional[str] = None,
     initial_inventory_map: Optional[Dict[str, float]] = None,
     min_lot_map: Optional[Dict[int, float]] = None,
     safety_stock_map: Optional[Dict[int, float]] = None,
@@ -426,13 +427,10 @@ def optimize_plan(
     safety_stock_map = safety_stock_map or {0: 0, 1: 0, 2: 0, 3: 0}
     weight_map = weight_map or {0: 5.0, 1: 2.0, 2: 0.5, 3: 1.0}
 
-    # ✅ preprocess: normalize + (dt_col 있으면 snapshot)
     df = preprocess_forecast(forecast_by_product, prod_col=prod_col, dt_col=dt_col)
     prod_col_n = _normalize_col(prod_col)
-
     df[prod_col_n] = df[prod_col_n].astype(str).str.replace(r"\.0$", "", regex=True)
 
-    # ✅ horizons normalize + past-ref 제거 + 정렬 강제
     hz = [_normalize_col(h) for h in horizons if h is not None]
     hz = [h for h in hz if not _is_past_ref(h)]
     hz = _sort_horizons_kor(hz)
@@ -440,7 +438,6 @@ def optimize_plan(
     if not hz:
         raise ValueError("horizons is empty after normalization/past-ref filtering.")
 
-    # ✅ horizons 컬럼 존재 확인
     missing = [h for h in hz if h not in df.columns]
     if missing:
         raise KeyError(f"horizon columns missing in forecast input: {missing}\navailable={list(df.columns)}")
@@ -449,7 +446,7 @@ def optimize_plan(
     P, D = len(products), len(hz)
 
     demand_f = df[hz].to_numpy(dtype=float)
-    demand_i = np.rint(np.maximum(demand_f, 0.0) * scale).astype(int)  # (P,D)
+    demand_i = np.rint(np.maximum(demand_f, 0.0) * scale).astype(int)
 
     day_cap = int(daily_capacity * scale)
     PROD_UB = day_cap
@@ -459,7 +456,6 @@ def optimize_plan(
     produce = _make_2d_int(model, P, D, 0, PROD_UB, "produce")
     is_prod = _make_2d_bool(model, P, D, "is_prod")
 
-    # ---- Warm-start (AddHint) ----
     if hint_plan:
         for i, p in enumerate(products):
             for d in range(D):
@@ -470,7 +466,6 @@ def optimize_plan(
                     model.AddHint(produce[i][d], v)
                     model.AddHint(is_prod[i][d], 1 if v > 0 else 0)
 
-    # lot/production + CAPA
     for i, p in enumerate(products):
         cid = int(cluster_info.get(p, 1))
         min_lot = int(min_lot_map.get(cid, 0) * scale)
@@ -489,7 +484,7 @@ def optimize_plan(
     # BASIC MODE
     # =====================================================
     if not use_cvar_obj:
-        cum_dem = np.cumsum(demand_i, axis=1)  # (P,D)
+        cum_dem = np.cumsum(demand_i, axis=1)
         STATE_UB = _safe_int_cap(int(cum_dem.max() * 2))
 
         stock   = _make_2d_int(model, P, D, -STATE_UB, STATE_UB, "stock")
@@ -583,9 +578,9 @@ def optimize_plan(
     if D2 > D:
         mc_scenarios = mc_scenarios[:, :, :D]
 
-    mc_demand_i = np.rint(np.maximum(mc_scenarios, 0.0) * scale).astype(int)  # (S,P,D)
+    mc_demand_i = np.rint(np.maximum(mc_scenarios, 0.0) * scale).astype(int)
 
-    cum_dem_max = np.cumsum(mc_demand_i, axis=2).max(axis=0)  # (P,D)
+    cum_dem_max = np.cumsum(mc_demand_i, axis=2).max(axis=0)
     STATE_UB = _safe_int_cap(int(cum_dem_max.max() * 2))
 
     stock_s   = _make_3d_int(model, S, P, D, -STATE_UB, STATE_UB, "stock_s")
@@ -615,7 +610,6 @@ def optimize_plan(
                 if s_stock > 0:
                     model.Add(inv_s[s][i][d] >= s_stock)
 
-    # ---- Shortage 정의: backlog 증가분(신규 미충족) ----
     SHORT_UB = STATE_UB
     shortage_s = _make_3d_int(model, S, P, D, 0, SHORT_UB, "short_s")
 
@@ -627,18 +621,32 @@ def optimize_plan(
                 model.Add(inc == backlog_s[s][i][d] - backlog_s[s][i][d-1])
                 model.AddMaxEquality(shortage_s[s][i][d], [inc, ZERO])
 
-    # ---- Scenario aggregates ----
-    sum_bd = int(STATE_UB * P * D)
-    sum_bd = _safe_int_cap(sum_bd, cap=3_000_000_000)
+    # =====================================================
+    # ✅ NEW: Scenario aggregates (weighted by cluster weight_map)
+    # =====================================================
+    W_SCALE = 100  # weight 정수화 스케일 (5.0 -> 500)
 
-    total_short_s = [model.NewIntVar(0, sum_bd, f"total_short_s{s}") for s in range(S)]
-    sum_inv_s     = [model.NewIntVar(0, sum_bd, f"sum_inv_s{s}")     for s in range(S)]
+    prod_w = []
+    for p in products:
+        cid = int(cluster_info.get(p, 1))
+        w = float(weight_map.get(cid, 1.0))
+        prod_w.append(int(round(w * W_SCALE)))
+    prod_w = np.asarray(prod_w, dtype=int)  # (P,)
+
+    # UB (넉넉히) : STATE_UB * P * D * max_w
+    sum_bd_w = int(STATE_UB * P * D * int(max(prod_w.max(), 1)))
+    sum_bd_w = _safe_int_cap(sum_bd_w, cap=3_000_000_000)
+
+    total_short_w_s = [model.NewIntVar(0, sum_bd_w, f"total_short_w_s{s}") for s in range(S)]
+    sum_inv_w_s     = [model.NewIntVar(0, sum_bd_w, f"sum_inv_w_s{s}")     for s in range(S)]
 
     for s in range(S):
-        model.Add(total_short_s[s] == sum(shortage_s[s][i][d] for i in range(P) for d in range(D)))
-        model.Add(sum_inv_s[s]     == sum(inv_s[s][i][d]      for i in range(P) for d in range(D)))
+        model.Add(total_short_w_s[s] == sum(prod_w[i] * shortage_s[s][i][d] for i in range(P) for d in range(D)))
+        model.Add(sum_inv_w_s[s]     == sum(prod_w[i] * inv_s[s][i][d]      for i in range(P) for d in range(D)))
 
-    # ---- Rate-based loss (evaluator와 같은 철학) ----
+    # =====================================================
+    # Rate-based loss (weighted aggregates 사용)
+    # =====================================================
     total_dem_i = mc_demand_i.sum(axis=(1, 2)).astype(int)
     total_dem_i = np.maximum(total_dem_i, 1)
 
@@ -648,8 +656,9 @@ def optimize_plan(
     inv_rate_int   = [model.NewIntVar(0, int(loss_scale), f"inv_rate_int_s{s}")   for s in range(S)]
 
     for s in range(S):
-        model.AddDivisionEquality(short_rate_int[s], total_short_s[s] * int(loss_scale), int(total_dem_i[s]))
-        model.AddDivisionEquality(inv_rate_int[s],   sum_inv_s[s]     * int(loss_scale), int(denom_inv))
+        # ✅ 분모에 W_SCALE 포함 (정수화한 weight 스케일 복원)
+        model.AddDivisionEquality(short_rate_int[s], total_short_w_s[s] * int(loss_scale), int(total_dem_i[s]) * W_SCALE)
+        model.AddDivisionEquality(inv_rate_int[s],   sum_inv_w_s[s]     * int(loss_scale), int(denom_inv) * W_SCALE)
 
     WDEN = 1000
     wb_w = max(0, int(round(mc_wb * WDEN)))
@@ -718,7 +727,7 @@ def optimize_plan(
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError(f"OR-Tools: {solver.StatusName(status)} (실행 가능한 계획 실패)")
 
-    demand_mean = mc_scenarios.mean(axis=0)  # (P,D)
+    demand_mean = mc_scenarios.mean(axis=0)
 
     rows = []
     for d_in, hcol in enumerate(hz):
@@ -739,7 +748,7 @@ def optimize_plan(
 
     plan_df = pd.DataFrame(rows)
     diag = {
-        "mode": "cvar_shortage_rate",
+        "mode": "cvar_shortage_rate_weighted",
         "status": solver.StatusName(status),
         "objective": float(solver.ObjectiveValue()),
         "eta": int(solver.Value(eta)),
@@ -759,7 +768,8 @@ def optimize_plan(
         "smooth_w": int(smooth_w),
         "wb_w": int(wb_w),
         "wi_w": int(wi_w),
-        "note": "rate-based loss: wb*ShortageRate + wi*InventoryRate. day_idx=0 is the first horizon column.",
+        "W_SCALE": int(W_SCALE),
+        "note": "rate-based loss: wb*WeightedShortageRate + wi*WeightedInventoryRate. day_idx=0 is the first horizon column.",
     }
     print("[CVaR]", diag)
     return plan_df, diag
@@ -852,7 +862,7 @@ def main():
     ap.add_argument("--out_csv", required=True)
 
     ap.add_argument("--product_col", default="Product_Number")
-    ap.add_argument("--dt_col", default="DateTime")  # ✅ 하드코딩 제거: CLI로 받음
+    ap.add_argument("--dt_col", default="DateTime")
 
     ap.add_argument("--horizon_kind", default="planned", choices=["planned", "expected", "both"])
     ap.add_argument("--horizons", nargs="*", default=None)
@@ -895,7 +905,6 @@ def main():
 
     forecast_df = preprocess_forecast(pred, prod_col=args.product_col, dt_col=args.dt_col)
 
-    # horizons 결정
     if args.horizons:
         h_raw = [_normalize_col(h) for h in args.horizons]
         h_raw = [h for h in h_raw if not _is_past_ref(h)]
@@ -928,7 +937,7 @@ def main():
             initial_inventory=args.initial_inventory,
             int_production=args.int_production,
             scale=args.scale,
-            dt_col=None,  # 이미 forecast_df는 스냅샷일 가능성이 높음
+            dt_col=None,
             min_lot_map=_load_map_json_or_file(args.min_lot_map),
             safety_stock_map=_load_map_json_or_file(args.safety_stock_map),
             weight_map=_load_map_json_or_file(args.weight_map),
