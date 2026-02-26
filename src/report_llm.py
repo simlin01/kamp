@@ -151,25 +151,43 @@ def _mc_stat(s: dict, metric: str) -> Optional[dict]:
     return v if isinstance(v, dict) else None
 
 
-def _mc_get(s: dict, metric: str, field: str, default=None):
+def _mc_get(s: dict, metric: str, stat: str, default=None):
     """
-    field alias:
-      - p90 ↔ VaR
-      - max ↔ worst
+    Supports both:
+      1) nested: s[metric][stat]
+      2) flat:   s[f"{metric}_{stat_lower}"]  e.g., ShortageRate_var
     """
-    d = _mc_stat(s, metric)
-    if not d:
+    if not isinstance(s, dict):
         return default
 
-    if field == "p90":
-        return d.get("p90", d.get("VaR", default))
-    if field == "VaR":
-        return d.get("VaR", d.get("p90", default))
-    if field == "max":
-        return d.get("max", d.get("worst", default))
-    if field == "worst":
-        return d.get("worst", d.get("max", default))
-    return d.get(field, default)
+    # 1) nested form
+    v = s.get(metric, None)
+    if isinstance(v, dict):
+        if stat in v:
+            return v.get(stat, default)
+        # allow lowercase aliases
+        stat_alias = {"VaR": "var", "worst": "worst", "CVaR": "cvar", "mean": "mean"}.get(stat, None)
+        if stat_alias and stat_alias in v:
+            return v.get(stat_alias, default)
+
+    # 2) flat form: Metric_stat
+    stat_key = {
+        "mean": "mean",
+        "VaR": "var",
+        "worst": "worst",
+        "CVaR": "cvar",
+    }.get(stat, stat.lower())
+
+    flat_key = f"{metric}_{stat_key}"
+    if flat_key in s:
+        return s.get(flat_key, default)
+
+    # 3) also support lowercase metric just in case
+    flat_key2 = f"{metric.lower()}_{stat_key}"
+    if flat_key2 in s:
+        return s.get(flat_key2, default)
+
+    return default
 
 
 def _mc_pick_service_metric(summary: dict) -> Tuple[str, Optional[dict]]:
@@ -194,6 +212,157 @@ def _trim_mc_validation(mc: Optional[dict], keep_per_scenario: bool) -> Optional
         if "per_scenario" in out:
             out.pop("per_scenario", None)
     return out
+
+
+
+def _normalize_mc_validation(mc: Optional[dict]) -> Optional[dict]:
+    """Normalize MC validation JSON into a consistent shape used by the report.
+
+    We support:
+      - Old style: summary has nested metrics: summary[Metric] = {mean, VaR, worst, CVaR?}, and summary has FailRate.
+      - New style (current evaluator): summary is mostly flat keys like ShortageRate_mean/var/cvar,
+        and per_scenario rows contain raw values and fail flags.
+
+    This function:
+      1) Ensures mc['summary'] contains nested metrics dicts for the report table.
+      2) Fills missing metrics (e.g., TotalDemand, InventoryRate) from per_scenario.
+      3) Computes 'worst'(max) and 'FailRate' from per_scenario when missing.
+    """
+    if not isinstance(mc, dict) or not mc:
+        return mc
+
+    summary = mc.get("summary")
+    per = mc.get("per_scenario")
+    cfg = mc.get("config") or {}
+
+    if summary is None and isinstance(mc, dict):
+        # allow passing summary-only as mc
+        summary = mc
+
+    # If already nested and has FailRate, we still may want to backfill worst if missing.
+    out_summary = dict(summary) if isinstance(summary, dict) else {}
+
+    def _ensure_nested(metric: str) -> dict:
+        d = out_summary.get(metric)
+        if isinstance(d, dict):
+            return d
+        d = {}
+        out_summary[metric] = d
+        return d
+
+    def _percentile(xs: list[float], q: float) -> float:
+        if not xs:
+            return float("nan")
+        arr = np.asarray(xs, dtype=float)
+        return float(np.quantile(arr, q))
+
+    # 1) Flat -> nested for key metrics where evaluator writes *_mean/var/cvar
+    # Map evaluator's 'var' to report's 'VaR', 'cvar' to 'CVaR'.
+    flat_map = [
+        ("ShortageRate", "ShortageRate"),
+        ("WShortageRate", "WShortageRate"),
+        ("loss", "Loss"),
+        ("w_loss", "WLoss"),
+    ]
+    for flat_prefix, metric_name in flat_map:
+        mean_k = f"{flat_prefix}_mean"
+        var_k = f"{flat_prefix}_var"
+        cvar_k = f"{flat_prefix}_cvar"
+        if mean_k in out_summary or var_k in out_summary or cvar_k in out_summary:
+            d = _ensure_nested(metric_name)
+            if "mean" not in d and mean_k in out_summary:
+                d["mean"] = out_summary.get(mean_k)
+            if "VaR" not in d and var_k in out_summary:
+                d["VaR"] = out_summary.get(var_k)
+            if "CVaR" not in d and cvar_k in out_summary:
+                d["CVaR"] = out_summary.get(cvar_k)
+
+    # 2) Fill from per_scenario (mean/VaR/worst and FailRate)
+    alpha = cfg.get("alpha", None)
+    try:
+        alpha = float(alpha)
+    except Exception:
+        alpha = None
+    q = alpha if (alpha is not None and 0 < alpha < 1) else 0.9
+
+    def _collect(key: str) -> list[float]:
+        if not isinstance(per, list):
+            return []
+        xs = []
+        for r in per:
+            if not isinstance(r, dict):
+                continue
+            v = r.get(key, None)
+            if v is None:
+                continue
+            try:
+                xs.append(float(v))
+            except Exception:
+                continue
+        return xs
+
+    # Metrics present in per_scenario
+    per_metrics = {
+        "TotalDemand": "TotalDemand",
+        "TotalShortage": "TotalShortage",
+        "ShortageRate": "ShortageRate",
+        "InventoryRate": "InventoryRate",
+        "loss": "Loss",
+        "WTotalDemand": "WTotalDemand",
+        "WTotalShortage": "WTotalShortage",
+        "WShortageRate": "WShortageRate",
+        "WInventoryRate": "WInventoryRate",
+        "w_loss": "WLoss",
+    }
+
+    for per_key, metric_name in per_metrics.items():
+        xs = _collect(per_key)
+        if not xs:
+            continue
+        d = _ensure_nested(metric_name)
+        if "mean" not in d or d.get("mean") is None:
+            d["mean"] = float(np.mean(xs))
+        if "VaR" not in d or d.get("VaR") is None:
+            d["VaR"] = _percentile(xs, q)
+        if "worst" not in d or d.get("worst") is None:
+            d["worst"] = float(np.max(xs))
+
+    # 3) FailRate
+    if "FailRate" not in out_summary or out_summary.get("FailRate") is None:
+        if isinstance(per, list) and per:
+            fail_flags = []
+            # Prefer non-weighted fail if exists, else weighted fail.
+            for r in per:
+                if not isinstance(r, dict):
+                    continue
+                v = r.get("fail", None)
+                if v is None:
+                    v = r.get("w_fail", None)
+                if v is None:
+                    continue
+                try:
+                    fail_flags.append(float(v))
+                except Exception:
+                    continue
+            if fail_flags:
+                # if flags are 0/1, mean is rate. If they are booleans, float conversion works.
+                out_summary["FailRate"] = float(np.mean(fail_flags))
+
+    # 4) Convenience keys for downstream (backward compat)
+    # Some code paths look for TotalDemand_mean style.
+    for metric_name in ["TotalDemand", "TotalShortage", "AvgInventory", "InventoryRate"]:
+        d = out_summary.get(metric_name)
+        if isinstance(d, dict):
+            for k, alias in [("mean", "mean"), ("VaR", "var"), ("worst", "worst"), ("CVaR", "cvar")]:
+                if k in d:
+                    out_summary[f"{metric_name}_{alias}"] = d[k]
+
+    # Put back
+    out = dict(mc)
+    out["summary"] = out_summary
+    return out
+
+
 
 
 # =========================================================
@@ -757,6 +926,15 @@ def _extract_llm_exec_commentary(md: str) -> str:
 
     return "\n".join(parts).strip()
 
+def _get_failrate(mc: dict, summary: dict) -> float:
+    for k in ["FailRate", "fail_rate", "FailRate_mean", "failrate"]:
+        v = summary.get(k, None) if isinstance(summary, dict) else None
+        if v is not None:
+            return float(v)
+        v = mc.get(k, None) if isinstance(mc, dict) else None
+        if v is not None:
+            return float(v)
+    return 0.0
 
 # =========================================================
 # HTML / Charts
@@ -980,16 +1158,20 @@ def _grade_traffic_light(facts: dict) -> dict:
 
     mc = facts.get("mc_validation") or {}
     s = mc.get("summary", mc) if isinstance(mc, dict) else {}
-    fail = float(s.get("FailRate", 0.0) or 0.0)
+    mc = facts.get("mc_validation") or {}
+    fail = _get_failrate(mc, s)
 
     service_metric_name, _ = _mc_pick_service_metric(s)
     sr_v = _mc_get(s, service_metric_name, "VaR", None)
     sr_worst = _mc_get(s, service_metric_name, "worst", None)
 
-    def _lvl(v):
+    def _lvl(v: str) -> int:
         return {"green": 0, "yellow": 1, "red": 2}.get(v, 1)
 
     total_demand = _mc_get(s, "TotalDemand", "mean", None)
+
+    if total_demand is None:
+        total_demand = _mc_get(mc, "TotalDemand", "mean", None)
     total_demand = float(total_demand) if total_demand is not None else None
     backlog_rate = (total_backlog / total_demand) if (total_demand and total_demand > 0) else None
 
@@ -1011,13 +1193,7 @@ def _grade_traffic_light(facts: dict) -> dict:
         else:
             service = "green"
 
-    # 2 )MC tail risk 안전장치 (p90/worst 낮으면 유지됨)
-    #    GREEN이어도 p90>=5%면 YELLOW, worst>=10%면 RED로 상향
-    if service == "green":
-        if sr_v is not None and float(sr_v) >= 0.05:
-            service = "yellow"
-        if sr_worst is not None and float(sr_worst) >= 0.10:
-            service = "red"
+    # ❌ (요청 반영) 2) MC tail risk 안전장치 블록 제거
 
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage") or []
@@ -1063,7 +1239,21 @@ def _grade_traffic_light(facts: dict) -> dict:
     else:
         forecast = "green"
 
-    overall = max([service, inventory, capacity, forecast], key=_lvl)
+    dims = [service, inventory, capacity, forecast]
+    n = len(dims)
+    red_cnt = sum(1 for d in dims if d == "red")
+    yellow_cnt = sum(1 for d in dims if d == "yellow")
+    green_cnt = sum(1 for d in dims if d == "green")
+
+    # ✅ (요청 반영) 종합등급: 최악값이 아닌 "비율/분포" 기반 산정
+    avg_score = (2.0 * red_cnt + 1.0 * yellow_cnt) / max(n, 1)
+
+    if avg_score >= 1.25:
+        overall = "red"
+    elif avg_score >= 0.50:
+        overall = "yellow"
+    else:
+        overall = "green"
 
     return {
         "overall": overall,
@@ -1080,6 +1270,8 @@ def _grade_traffic_light(facts: dict) -> dict:
             "min_coverage": min_cov,
             "top_over_1": top_over_1,
             "r2_t": r2_t,
+            "grade_counts": {"red": red_cnt, "yellow": yellow_cnt, "green": green_cnt},
+            "overall_avg_score": avg_score,
         },
     }
 
@@ -1158,6 +1350,7 @@ def _render_canonical_md(facts: dict) -> str:
     md.append("")
 
     mc = facts.get("mc_validation") or None
+
     if isinstance(mc, dict) and mc:
         s = mc.get("summary", mc)
         md.append("## 3) 수요 변동성 리스크 (Monte Carlo)")
@@ -1166,11 +1359,11 @@ def _render_canonical_md(facts: dict) -> str:
         md.append("|---|---:|---:|---:|")
         svc_name, _ = _mc_pick_service_metric(s)
         if _mc_stat(s, svc_name):
-            md.append(f"| {svc_name} | {_fmt(_mc_get(s, svc_name, 'mean'),4)} | {_fmt(_mc_get(s, svc_name, 'p90'),4)} | {_fmt(_mc_get(s, svc_name, 'max'),4)} |")
+            md.append(f"| {svc_name} | {_fmt(_mc_get(s, svc_name, 'mean'),4)} | {_fmt(_mc_get(s, svc_name, 'VaR'),4)} | {_fmt(_mc_get(s, svc_name, 'worst'),4)} |")
         if _mc_stat(s, "InventoryRate"):
-            md.append(f"| InventoryRate | {_fmt(_mc_get(s,'InventoryRate','mean'),4)} | {_fmt(_mc_get(s,'InventoryRate','p90'),4)} | {_fmt(_mc_get(s,'InventoryRate','max'),4)} |")
+            md.append(f"| InventoryRate | {_fmt(_mc_get(s,'InventoryRate','mean'),4)} | {_fmt(_mc_get(s,'InventoryRate','VaR'),4)} | {_fmt(_mc_get(s,'InventoryRate','worst'),4)} |")
         if _mc_stat(s, "Loss"):
-            md.append(f"| Loss | {_fmt(_mc_get(s,'Loss','mean'),4)} | {_fmt(_mc_get(s,'Loss','p90'),4)} | {_fmt(_mc_get(s,'Loss','max'),4)} |")
+            md.append(f"| Loss | {_fmt(_mc_get(s,'Loss','mean'),4)} | {_fmt(_mc_get(s,'Loss','VaR'),4)} | {_fmt(_mc_get(s,'Loss','worst'),4)} |")
             cvar = _mc_get(s, "Loss", "CVaR", None)
             if cvar is not None:
                 md.append(f"\n- **Loss CVaR(alpha)**: {_fmt(cvar,4)}")
@@ -1303,6 +1496,8 @@ def generate_rule_based_actions(facts: dict) -> List[str]:
     tl = rep.get("timeline", {})
     pm = facts.get("planning_metrics", {}) or {}
     mc = facts.get("mc_validation", {}) or {}
+    mc = facts.get("mc_validation") or {}
+    summary = mc.get("summary", {}) if isinstance(mc, dict) else {}
     s = mc.get("summary", mc) if isinstance(mc, dict) else {}
 
     avg_util = pm.get("Utilization_mean", tl.get("avg_utilization"))
@@ -1371,6 +1566,7 @@ def build_report_with_llm(
 
     pm = _load_json_if_exists(planning_metrics_json) if planning_metrics_json else None
     mc_raw = _load_json_if_exists(mc_json) if mc_json else None
+    mc_raw = _normalize_mc_validation(mc_raw)
     mc_summary = _trim_mc_validation(mc_raw, keep_per_scenario=keep_mc_per_scenario)
 
     facts = {
