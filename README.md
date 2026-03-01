@@ -3,6 +3,15 @@
 
 ---
 
+## Authors
+
+| Name | GitHub |
+|------|--------|
+| 심승현 | https://github.com/simlin01 |
+| 채소연 | https://github.com/Chaesoyeon |
+
+---
+
 ## Abstract
 
 본 연구는 수요 변동성과 설비 제약이 동시에 존재하는 제조 환경에서의 생산계획 문제를 확률적 리스크 관점에서 재정의한다. 단일 예측값 기반 최적화는 평균 성능에는 적합할 수 있으나, 실제 운영 환경에서 발생하는 tail risk를 충분히 반영하지 못한다.  
@@ -82,11 +91,13 @@ Monte Carlo 결과를 기반으로 다음 정책 파라미터를 반복 조정�
 
 본 시스템은 다음과 같은 통합 파이프라인으로 구성된다.
 
+```
 Demand Forecasting  
 → CP-SAT Optimization  
 → Monte Carlo Risk Evaluation  
 → Traffic Light Diagnosis  
 → LLM-based Executive Report  
+```
 
 - Traffic Light 기반 경영진 진단 체계  
 - 자동 리포트 생성 및 정책 피드백 루프 구현  
