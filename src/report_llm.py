@@ -445,6 +445,16 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
 
     top_backlog_df = grp.sort_values("backlog", ascending=False).head(5).copy()
     top_backlog = top_backlog_df[["Product_Number", "backlog", "BacklogRate"]].to_dict(orient="records")
+           
+    min_coverage_value = None
+    try:
+        tmp_cov = grp.copy()
+        tmp_cov = tmp_cov[tmp_cov["demand"].fillna(0.0) > 0].copy()
+        tmp_cov["InvCoverage"] = tmp_cov["end_inventory"].fillna(0.0) / (tmp_cov["demand"].fillna(0.0) + _EPS)
+        if not tmp_cov.empty:
+            min_coverage_value = float(tmp_cov["InvCoverage"].min())
+    except Exception:
+        min_coverage_value = None
 
     top_low_coverage = []
     if len(top_backlog) > 0 and float(pd.Series([r.get("backlog", 0.0) for r in top_backlog]).fillna(0.0).sum()) == 0.0:
@@ -468,6 +478,7 @@ def summarize_by_product(plan_csv: str, product_col_candidates=("product_number"
         "top_backlog": top_backlog,
         "top_overprod": top_overprod,
         "top_low_coverage": top_low_coverage,
+        "min_coverage": min_coverage_value, 
     }
 
 
@@ -1197,7 +1208,13 @@ def _grade_traffic_light(facts: dict) -> dict:
 
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage") or []
-    min_cov = float(low_cov[0].get("InvCoverage", 1.0)) if low_cov else None
+
+    if low_cov:
+        min_cov = float(low_cov[0].get("InvCoverage", 1.0))
+    else:
+        # ✅ top_low_coverage가 비어도 전체 품목 기준 min coverage 사용
+        min_cov = ps.get("min_coverage", None)
+        min_cov = float(min_cov) if min_cov is not None else None
     top_over = ps.get("top_overprod") or []
     top_over_1 = float(top_over[0].get("over_score", 0.0)) if top_over else 0.0
 
@@ -1215,9 +1232,9 @@ def _grade_traffic_light(facts: dict) -> dict:
     elif avg_util >= 0.92:
         capacity = "yellow"
     elif avg_util >= 0.80:
-        capacity = "red"
-    else:
         capacity = "yellow"
+    else:
+        capacity = "red"
 
     ms = facts.get("metrics_summary") or {}
     by_h = ms.get("by_horizon") or []
