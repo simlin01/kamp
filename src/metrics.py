@@ -5,25 +5,6 @@ Metrics utilities for SCM pipeline:
 - Forecast metrics: MAE, RMSE, WAPE, sMAPE, Bias (ME/MPE)
 - Planning  metrics: FillRate, ShortageRate, BacklogLevelRate, Utilization, Smoothness, InventoryTurnover
 - Optional cluster-level metrics when feat_df (Product_Number, Cluster) provided
-
-[IMPORTANT]
-- Planning FillRate is computed from "shortage" = backlog increase (new unmet demand),
-  consistent with planner_opt / evaluator definition:
-    shortage_t = max(backlog_t - backlog_{t-1}, 0), shortage_0 = backlog_0
-  TotalShortage = sum(shortage)
-  ShortageRate  = TotalShortage / TotalDemand
-  FillRate      = 1 - ShortageRate
-
-[이번 수정 핵심: forecast.py/planner_opt.py 변경 반영]
-1) Forecast wide-form horizons 자동탐지 시:
-   - '작년/전년/지난해' 과거 참조 컬럼은 무조건 제외
-   - horizon_kind(planned/expected/both) 필터 지원 (기본 planned 권장)
-   - 같은 horizon에 planned+expected가 섞여 있어도 planned 우선 선택 가능
-2) Plan 컬럼 표준화 강화: shortage 컬럼이 있으면 backlog 없이도 service 계산 가능(기존 유지)
-3) CVaR mean plan에서 FillRate 왜곡 방지(기존 유지):
-   - shortage 컬럼이 있으면 backlog diff로 재계산하지 않고 shortage를 우선 사용
-   - shortage 합산은 항상 (product, day) 단위로 집계 후 총합으로 계산
-4) Cluster KPI 계산 안전화(기존 유지)
 """
 
 from __future__ import annotations
@@ -173,11 +154,6 @@ def _extract_horizon_index(col: str) -> Optional[int]:
 
 
 def _within_key(col: str) -> int:
-    """
-    같은 horizon 내 우선순위:
-    - 예정(planned) 먼저
-    - 예상(expected) 다음
-    """
     c = _norm(col)
     if "예정" in c:
         return 0
@@ -187,11 +163,6 @@ def _within_key(col: str) -> int:
 
 
 def _filter_horizons_by_kind(cols: List[str], horizon_kind: str) -> List[str]:
-    """
-    forecast.py 변경 반영:
-    - 기본 planned(예정)만 평가하는 것이 일반적으로 맞음(=y 타깃)
-    - both는 허용하되, 같은 horizon에 planned+expected가 있으면 planned만 남김(안전)
-    """
     hk = str(horizon_kind).lower().strip()
     if hk not in ("planned", "expected", "both"):
         raise ValueError("--horizon_kind must be one of: planned, expected, both")
@@ -210,7 +181,6 @@ def _filter_horizons_by_kind(cols: List[str], horizon_kind: str) -> List[str]:
     if hk == "expected":
         return [c for c in cols if is_expected(c)]
 
-    # both: day별로 하나만(예정 우선)
     by_h: Dict[int, List[str]] = {}
     for c in cols:
         h = _extract_horizon_index(c)
@@ -238,13 +208,6 @@ def detect_horizons_from_df(
     product_col: str,
     horizon_kind: str = "planned",
 ) -> List[str]:
-    """
-    wide-form forecast metrics를 위한 horizon 컬럼 자동 탐지.
-    ✅ 변경점:
-    - 과거참조(작년/전년/지난해) 컬럼은 무조건 제외
-    - horizon_kind 필터(기본 planned)
-    - 같은 horizon에 planned+expected가 있으면 planned 우선 선택 가능(both일 때)
-    """
     cands: List[str] = []
     for c in df.columns:
         if c == product_col:
@@ -299,10 +262,6 @@ def compute_forecast_metrics(
     product_col: str,
     horizon_kind: str = "planned",
 ) -> Dict[str, float]:
-    """
-    - long-form이면 horizon 개념 없이 (product, date) join 후 평가
-    - wide-form이면 horizons가 없을 때 자동탐지 + horizon_kind 필터 적용
-    """
     if _detect_long_form(pred_df) and _detect_long_form(actuals_df):
         yhat, y = _align_long(pred_df, actuals_df, product_col)
     else:
@@ -407,7 +366,7 @@ def compute_planning_metrics(
 
     backlog_level_total = float(df["backlog"].fillna(0.0).sum())
 
-    # ✅ service metrics
+    # service metrics
     if df["shortage"].notna().any():
         total_shortage = _compute_shortage_from_shortage_col(df.fillna({"shortage": 0.0}), product_col=product_col)
     else:
@@ -516,7 +475,6 @@ if __name__ == "__main__":
     parser.add_argument("--feat_csv", type=str)
     parser.add_argument("--product_col", type=str, default="Product_Number")
 
-    # ✅ forecast.py/planner_opt.py 변경 반영: default planned
     parser.add_argument("--horizon_kind", type=str, default="planned", choices=["planned", "expected", "both"],
                         help="Wide-form forecast evaluation에서 자동탐지 시 사용할 horizon 종류. 기본 planned 권장.")
     parser.add_argument("--horizons", nargs="*", default=None)

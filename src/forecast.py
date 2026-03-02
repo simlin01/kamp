@@ -3,22 +3,6 @@
 
 """
 forecast.py — Leakage-safe Multi-Horizon Forecast (feat.csv → predict)
-
-[수정 핵심(현 파이프라인 기준 권장)]
-- ✅ y(타깃)는 기본적으로 "예정 수주량"만 사용 (planner 입력/수요 예측의 정석)
-- ✅ "예상 수주량"은 기본적으로 feature로 활용(=기존 baseline forecast 보정) 가능
-  - 단, 원하면 옵션으로 feature 제외/타깃 전환 가능
-- ✅ '작년/전년/지난해'는 과거 참조이므로
-  - 타깃에서 무조건 제외 (누수/혼입 방지)
-  - feature로는 적극 허용
-- ✅ horizon 선택 가능(기본 T+1~T+4). planner와 MC day_idx 정의가 깔끔해짐.
-- ✅ MC 시나리오: 잔차 벡터 resample로 horizon 상관 보존 + mean-centering
-- ✅ planner 입력(pred_*_by_product.csv)과 MC d_hat은 "제품별 최신 스냅샷" 기준으로 통일
-
-[추가 안정화(매우 중요)]
-- ✅ find_target_cols: 구버전 호출(키워드 리스트 전달)과 신버전 호출(target_kind str) 모두 허용
-- ✅ build_xy: 구버전 호출(build_xy(df, prod_col, target_cols, log_target))이 깨지지 않도록
-          시그니처를 (log_target이 4번째 포지션)으로 호환
 """
 
 from __future__ import annotations
@@ -62,8 +46,8 @@ DEFAULT_DT_COL   = "DateTime"
 PAST_MARKERS = ["작년", "전년", "지난해"]
 
 KIND_TO_KEYWORDS = {
-    "planned":  ["예정 수주량"],   # y 기본(권장)
-    "expected": ["예상 수주량"],   # baseline forecast
+    "planned":  ["예정 수주량"], 
+    "expected": ["예상 수주량"],
     "both":     ["예상 수주량", "예정 수주량"],
 }
 
@@ -108,12 +92,6 @@ def _is_past_ref(col: str) -> bool:
 
 
 def _extract_horizon_index(col: str) -> Optional[int]:
-    """
-    - "T일 ..." -> 0
-    - "T+3일 ..." -> 3
-    - 축약형 "T" -> 0
-    - 축약형 "T+3" -> 3
-    """
     c = _norm(col)
 
     # 축약형
@@ -137,12 +115,6 @@ def _extract_horizon_index(col: str) -> Optional[int]:
 
 
 def _target_priority(col: str) -> int:
-    """
-    같은 horizon 내에서 정렬 우선순위:
-      0: '예정'
-      1: '예상'
-      9: 기타
-    """
     cc = _norm(col)
     if "예정" in cc:
         return 0
@@ -152,10 +124,6 @@ def _target_priority(col: str) -> int:
 
 
 def _parse_horizons(s: str) -> List[int]:
-    """
-    예: "1,2,3,4" -> [1,2,3,4]
-    예: "0,1,2"   -> [0,1,2]
-    """
     parts = [p.strip() for p in str(s).split(",") if p.strip() != ""]
     hs = []
     for p in parts:
@@ -169,12 +137,6 @@ def _find_target_cols_by_keywords(
     keywords: List[str],
     horizons: Optional[List[int]] = None,
 ) -> List[str]:
-    """
-    구버전 호환용: keywords(예: ["예상 수주량","예정 수주량"])를 직접 받아 타깃 탐지.
-    - 과거 참조('작년/전년/지난해')는 무조건 제외
-    - horizon 패턴 포함
-    - horizons가 주어지면 그 h만 남김
-    """
     cands: List[str] = []
     for c in df.columns:
         cc = _norm(c)
@@ -213,25 +175,12 @@ def find_target_cols(
     target_kind: Union[str, List[str], Tuple[str, ...]],
     horizons: Optional[List[int]] = None,
 ) -> List[str]:
-    """
-    ✅ 타깃 컬럼 탐지 (호환 포함)
-
-    [신버전 사용]
-      find_target_cols(df, target_kind="planned"|"expected"|"both", horizons=[1,2,3,4])
-
-    [구버전 호환]
-      find_target_cols(df, ["예상 수주량","예정 수주량"], horizons=[...])
-
-    공통 정책:
-      - '작년/전년/지난해' 포함 컬럼은 타깃에서 무조건 제외 (누수/혼입 방지)
-      - (h, priority, name) 정렬
-    """
-    # ---- 구버전: 키워드 리스트를 넘긴 경우 ----
+    # ---- 키워드 리스트를 넘긴 경우 ----
     if isinstance(target_kind, (list, tuple)):
         keywords = [str(x) for x in target_kind]
         return _find_target_cols_by_keywords(df, keywords=keywords, horizons=horizons)
 
-    # ---- 신버전: kind 문자열 ----
+    # ---- kind 문자열 ----
     if target_kind not in KIND_TO_KEYWORDS:
         raise ValueError(f"invalid target_kind={target_kind}. choose from {list(KIND_TO_KEYWORDS.keys())}")
     keywords = KIND_TO_KEYWORDS[target_kind]
@@ -248,12 +197,6 @@ def select_feature_columns(
     target_kind: str,
     allow_expected_as_feature: bool,
 ) -> Tuple[List[str], List[str]]:
-    """
-    기본 정책(권장):
-    - y가 planned(예정)일 때: '예상 수주량'(non-past)은 feature로 허용 가능(보정 모델)
-    - y가 expected 또는 both일 때: 예/예정(non-past) 모두 feature에서 제외(보수적으로 누수 방지)
-    - 작년/전년/지난해는 과거로 간주 → feature 허용
-    """
     numeric_all = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
     excluded: List[str] = []
 
@@ -294,15 +237,6 @@ def build_xy(
     target_kind: str = "planned",
     allow_expected_as_feature: bool = True,
 ):
-    """
-    ✅ backward-compatible signature
-
-    - 구버전(많이 쓰던 형태):
-        X, y, num_cols, cat_cols, excluded = build_xy(df, prod_col, target_cols, log_target)
-
-    - 신버전:
-        build_xy(df, prod_col, target_cols, log_target=False, target_kind="planned", allow_expected_as_feature=True)
-    """
     if prod_col not in df.columns:
         raise ValueError(f"'{prod_col}' 컬럼이 없습니다.")
 
@@ -441,15 +375,6 @@ def generate_demand_scenarios(
     n_scenarios: int,
     seed: int = 2025
 ) -> np.ndarray:
-    """
-    residual bootstrap 기반 시나리오 생성.
-    ✅ horizon별 독립 샘플링이 아니라, 잔차 '벡터(행)'를 통째로 resample하여
-    horizon 간 상관관계를 보존한다.
-
-    d_hat: (n, k)
-    residuals: (m, k)  (y_true - y_pred), horizon별 mean=0 권장(바이어스 완화)
-    return: (S, n, k)
-    """
     rng = np.random.default_rng(seed)
     S = int(n_scenarios)
     if S <= 0:
@@ -478,11 +403,6 @@ def snapshot_latest_by_product(
     dt_col: str,
     value_cols: List[str],
 ) -> pd.DataFrame:
-    """
-    Product별 최신 DateTime 스냅샷.
-    - dt_col 없거나 파싱 불가면 product별 평균으로 대체
-    반환: [prod_col] + value_cols
-    """
     if prod_col not in df.columns:
         raise ValueError(f"'{prod_col}' column not found")
     for c in value_cols:
@@ -767,13 +687,13 @@ def main():
     ap.add_argument("--model", default="lgbm", choices=["tweedie", "lgbm"])
     ap.add_argument("--log_target", action="store_true")
 
-    # ✅ y(타깃) 정의
+    # y(타깃) 정의
     ap.add_argument("--target_kind", default="planned", choices=["planned", "expected", "both"],
                     help="planned(예정) | expected(예상) | both(예상+예정). 기본 planned 권장")
     ap.add_argument("--horizons", default="1,2,3,4",
                     help="예측할 horizon 인덱스. 예: '1,2,3,4' (기본: T+1~T+4). '0,1,2,3,4'도 가능")
 
-    # ✅ feature에서 예상 수주량 활용 여부(기본: planned 타깃이면 True)
+    # feature에서 예상 수주량 활용 여부
     ap.add_argument("--allow_expected_as_feature", action="store_true",
                     help="planned 타깃일 때, non-past '예상 수주량'을 feature로 허용(권장).")
     ap.add_argument("--disallow_expected_as_feature", action="store_true",
@@ -820,7 +740,7 @@ def main():
 
     df = pd.read_csv(args.inp)
 
-    # ✅ 타깃 탐지 (작년/전년/지난해 자동 제외 + horizon 필터)
+    # 타깃 탐지 (작년/전년/지난해 자동 제외 + horizon 필터)
     target_cols = find_target_cols(df, target_kind=args.target_kind, horizons=horizons)
     if not target_cols:
         raise RuntimeError(f"Target columns not found. target_kind={args.target_kind}, horizons={horizons}")
@@ -923,7 +843,7 @@ def main():
 
     residuals_pool = _clip_residuals(residuals_pool, args.res_clip_q)
 
-    # ✅ horizon별 residual mean 제거 → MC 평균 바이어스 완화
+    # horizon별 residual mean 제거 → MC 평균 바이어스 완화
     residuals_pool = residuals_pool - residuals_pool.mean(axis=0, keepdims=True)
 
     print("Validation metrics")
@@ -1007,7 +927,7 @@ def main():
         print(f"MC scenarios saved: {mc_out}")
 
     # =====================================================
-    # ✅ planner 입력용 제품단위 예측 저장: 최신 스냅샷 기반으로 통일
+    #  planner 입력용 제품단위 예측 저장: 최신 스냅샷 기반으로 통일
     # =====================================================
     prod_snap = snapshot_latest_by_product(
         pred_all,

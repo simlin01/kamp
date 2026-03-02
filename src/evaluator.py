@@ -7,12 +7,6 @@ evaluator.py
 - 통합 감사(Audit): 규칙 기반 검증 + (옵션) LLM 기반 자기평가/상호검증
 - 정책 학습(Policy): 성과 기반 파라미터 자동 업데이트, 저장/로딩
 - MC 시나리오 검증(ShortageRate 기반, planner_opt.py와 1:1 정합)
-
-[이번 추가]
-✅ mc_validate_plan()에 weight_map + cluster_info를 옵션으로 받아서
-   - 기존(무가중) 지표는 그대로 유지
-   - weighted shortage_rate / weighted loss를 추가로 저장
-   => “전체 서비스(무가중)” + “가중 서비스(중요도 반영)”를 동시에 보게 함.
 """
 
 from __future__ import annotations
@@ -46,7 +40,6 @@ def _quantile(x: np.ndarray, q: float) -> float:
 
 
 def _cvar(x: np.ndarray, alpha: float) -> float:
-    """CVaR_alpha = mean of tail beyond VaR_alpha (upper tail, larger is worse)."""
     x = np.asarray(x, dtype=float)
     if x.size == 0:
         return float("nan")
@@ -387,7 +380,6 @@ def _build_product_weight_map(
     cluster_info: Optional[Dict[str, int]] = None,
     weight_map: Optional[Dict[int, float]] = None,
 ) -> Dict[str, float]:
-    """product -> weight. 없으면 모두 1.0"""
     if not cluster_info or not weight_map:
         return {p: 1.0 for p in products}
 
@@ -408,15 +400,10 @@ def mc_validate_plan(
     w_i: float = 0.2,
     fail_threshold: float = 0.03,
     product_col: str = "Product_Number",
-    # ✅ NEW
+    # NEW
     cluster_info: Optional[Dict[str, int]] = None,
     weight_map: Optional[Dict[int, float]] = None,
 ) -> Dict[str, Any]:
-    """
-    return:
-      - 기존(무가중) per_scenario + summary
-      - 추가(가중) per_scenario + summary
-    """
     req = {"scenario_id", "day_idx", product_col, "demand"}
     missing = req - set(scenarios_df.columns)
     if missing:

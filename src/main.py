@@ -2,31 +2,6 @@
 # -*- coding: utf-8 -*-
 """
 main.py — End-to-end SCM planning pipeline (ONE-SHOT)
-
-[핵심 목표]
-1) "horizon(타깃) 오염" 완전 차단
-   - planner/MC에는 **예측 타깃(예상)** 만 넣고,
-   - '작년/전년/지난해' 같은 과거 참조 타깃은 어떤 단계에서도 절대 섞지 않음
-   - '예정'은 (업무적으로는 플랜/계획값일 가능성) → 기본은 제외(옵션으로만 허용)
-
-2) forecast → planner 입력 정합성
-   - pred_final_by_product.csv = 제품별 최신 스냅샷
-   - MC도 같은 horizon/제품 순서로 생성
-
-3) MC: (최적화) 30개 tail-aware 샘플링 + (검증) 전체 S 사용
-
-4) alpha 분리
-   - planner CVaR alpha(cvar_alpha)
-   - MC 검증 요약 alpha(mc_alpha)
-
-5) fail_threshold 기본값/CLI 반영 문제 해결
-   - parse_args 기본값을 run_pipeline 기본값과 동일하게 맞춤(0.25)
-
-[이번 수정 핵심]
-✅ forecast.py(최신 버전)와 100% 정합:
-- find_target_cols: target_kind 기반 호출 (expected/both/planned)
-- build_xy: (target_kind, allow_expected_as_feature, log_target) 시그니처 맞춤
-- planner/MC: 예상(예상 수주량)만 사용 (예정은 기본 제외, 옵션으로만 허용)
 """
 
 from __future__ import annotations
@@ -106,12 +81,6 @@ def _is_past_ref(col: str) -> bool:
 
 
 def _extract_horizon_idx(col: str) -> Optional[int]:
-    """
-    "T일 ..." -> 0
-    "T+3일 ..." -> 3
-    "T" -> 0
-    "T+3" -> 3
-    """
     import re
 
     s = str(col).strip()
@@ -134,18 +103,10 @@ def _extract_horizon_idx(col: str) -> Optional[int]:
 def _select_planner_horizons(
     df: pd.DataFrame,
     *,
-    prefer: str = "예상",          # 기본: "예상"만 사용
-    allow_scheduled: bool = False, # True면 '예정'도 포함 가능
-    max_h: int = 4                 # 0..max_h
+    prefer: str = "예상",
+    allow_scheduled: bool = False,
+    max_h: int = 4
 ) -> List[str]:
-    """
-    planner/MC에서 쓸 horizon 컬럼만 "확실히" 골라낸다.
-
-    - 과거 참조('작년/전년/지난해')는 무조건 제거
-    - 기본은 '예상'만 사용
-    - allow_scheduled=True면 '예정'도 포함 가능
-    - horizon index(0..max_h)만 남김
-    """
     cols = list(df.columns)
 
     def ok(c: str) -> bool:
@@ -181,7 +142,6 @@ def _select_planner_horizons(
 
 
 def _horizon_idx_list(max_h: int) -> List[int]:
-    """0..max_h"""
     return list(range(0, int(max_h) + 1))
 
 
@@ -207,8 +167,6 @@ def _run_forecast_python_api(
 
     dt_use = dt_col or (FO.DEFAULT_DT_COL if hasattr(FO, "DEFAULT_DT_COL") else "DateTime")
 
-    # ✅ main 정책: planner/MC는 "예상"만 → forecast도 expected를 y로 학습
-    # ✅ horizons는 0..planner_max_h 로 통일 (planner day_idx와 완전 일치)
     horizons_idx = _horizon_idx_list(planner_max_h)
     target_cols = FO.find_target_cols(df, target_kind="expected", horizons=horizons_idx)
 
@@ -218,7 +176,6 @@ def _run_forecast_python_api(
             f"columns(head)={list(df.columns)[:40]}"
         )
 
-    # expected 타깃이면 allow_expected_as_feature는 의미상 False (자기 자신 누수 방지)
     X, y, num_cols, cat_cols, _excluded = FO.build_xy(
         df=df,
         prod_col=prod_col,
@@ -298,7 +255,7 @@ def _run_forecast_python_api(
     pred_all.to_csv(out_pred_csv, index=False, encoding="utf-8-sig")
     metrics_df.to_csv(out_metrics_csv, encoding="utf-8-sig")
 
-    # ✅ 제품단(plan 입력)은 "최신 스냅샷"
+    # 제품단(plan 입력)은 "최신 스냅샷"
     prod_snap = FO.snapshot_latest_by_product(
         pred_all,
         prod_col=prod_col,

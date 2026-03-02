@@ -1,17 +1,7 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-features.py — 누출 없이 cross-horizon 기반 파생변수 생성 + 제품 패턴 클러스터링
-
-[핵심 수정]
-1) "예정 수주량" / "예상 수주량" 컬럼명 불일치 해결:
-   - T, T+1..T+4 컬럼을 자동 탐지해서 런타임에 target map 구성
-   - 작년 컬럼도 "작년 T일 예정/예상 수주량" 모두 지원
-2) cross-horizon/클러스터링이 컬럼명 때문에 스킵되지 않도록 안전화
-3) fillna(0)로 모든 컬럼을 덮어쓰지 않도록(데이터 왜곡 방지) 최소 범위로 처리
-   - 파생변수/비율계열만 안전 처리
-4) (추가) 키 컬럼(Product_Number/DateTime) normalize + fallback
-   - Product_Number가 다른 이름으로 들어와도 최대한 잡아줌
+features.py — cross-horizon 기반 파생변수 생성 + 제품 패턴 클러스터링
 """
 
 from __future__ import annotations
@@ -101,11 +91,6 @@ DEFAULT_COLS = {
 }
 
 def _normalize_key_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, str]:
-    """
-    Product_Number/DateTime이 다른 이름으로 들어올 수 있어서 최대한 맞춰준다.
-    - prod 후보: Product_Number, product, SKU, 품번
-    - dt 후보: DateTime, datetime, Date, 날짜
-    """
     df = df.copy()
 
     prod_col = None
@@ -127,7 +112,6 @@ def _normalize_key_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, str]:
     if dt_col is None:
         dt_col = DEFAULT_COLS["dt"]
 
-    # 표준명으로 rename(필요한 경우만)
     rename_map = {}
     if prod_col != DEFAULT_COLS["prod"]:
         rename_map[prod_col] = DEFAULT_COLS["prod"]
@@ -145,17 +129,10 @@ def _normalize_key_columns(df: pd.DataFrame) -> Tuple[pd.DataFrame, str, str]:
 # =========================
 
 def _norm_col(s: str) -> str:
-    """컬럼명 normalize(공백/특수문자 완화)"""
     return re.sub(r"\s+", " ", str(s)).strip()
 
 
 def detect_target_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """
-    데이터프레임에서 다음 컬럼을 자동 탐지하여 반환:
-    - demand_T, demand_Tp1..Tp4
-    - yoy_T (작년 T일 ...)
-    '예정/예상' 모두 지원.
-    """
     cols_norm = [_norm_col(c) for c in df.columns]
     col_map = { _norm_col(c): c for c in df.columns }  # normalized -> original
 
@@ -190,7 +167,7 @@ def detect_target_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         r"작년\s*T\s*일\s*(예정|예상)\s*수주량",
     ])
 
-    # fallback: 부분 문자열 기반(T일만이라도 꼭 잡기)
+    # fallback: 부분 문자열 기반
     if out["demand_T"] is None:
         for c0 in df.columns:
             c = _norm_col(c0)
@@ -206,7 +183,6 @@ def detect_target_cols(df: pd.DataFrame) -> Dict[str, Optional[str]]:
 # =========================
 
 def add_cross_horizon_features(df: pd.DataFrame, cols: Dict[str, Optional[str]]) -> pd.DataFrame:
-    """현재 데이터 구조(T, T+1, ..., T+4)를 활용한 cross-horizon 파생변수"""
     T  = cols.get("demand_T")
     T1 = cols.get("demand_Tp1")
     T2 = cols.get("demand_Tp2")
@@ -258,7 +234,7 @@ def add_cross_horizon_features(df: pd.DataFrame, cols: Dict[str, Optional[str]])
         yoy = pd.to_numeric(df[yoy_col], errors="coerce").astype(float)
         df["yoy_T"] = _stabilize_ratio(pd.Series(np.where(yoy != 0, base / yoy, np.nan)), 0.0, 10.0, 0.0).astype(float)
 
-    # ✅ 파생변수에서만 inf/nan 정리
+    # 파생변수에서만 inf/nan 정리
     gen_prefix = ("lag_diff_", "lag_ratio_", "cumsum_lag", "mean_future", "std_future",
                   "instability_coef", "trend_sign", "growth_index_", "yoy_")
     gen_cols = [c for c in df.columns if c.startswith(gen_prefix)]
@@ -269,7 +245,6 @@ def add_cross_horizon_features(df: pd.DataFrame, cols: Dict[str, Optional[str]])
 
 
 def add_time_features(df: pd.DataFrame, dt_col: str) -> pd.DataFrame:
-    """Datetime 기반 시간 파생 — 기존 DOW 문자열 제거 후 숫자형 요일 재계산"""
     if dt_col not in df.columns:
         print("시간 파생 생략: DateTime 컬럼 없음")
         return df

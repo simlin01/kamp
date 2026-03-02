@@ -45,3 +45,6 @@ outputs*/
 governance_audit.json
 mc_validation.json
 planning_metrics.json
+
+# local scratch
+rank_sweep_best.py

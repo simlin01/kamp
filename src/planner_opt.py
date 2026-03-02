@@ -3,18 +3,6 @@
 
 """
 planner_opt.py — CP-SAT 생산계획 (CVaR objective)
-
-[정합성/안전장치 강화 요약]
-✅ (1) optimize_plan에서 dt_col 하드코딩 제거 (DateTime 강제 X)
-✅ (2) horizons를 normalize해서 df.columns와 1:1 매칭 (weird space/유니코드 이슈 방어)
-✅ (3) horizons에 과거참조(작년/전년/지난해) 섞이면 즉시 제거/차단
-✅ (4) CLI 자동 detect_horizons + horizon_kind 필터는 유지
-✅ (5) main에서 horizons를 직접 넘겨도 깨지지 않도록 “컬럼 존재 check” 강화
-
-[이번 패치 핵심]
-✅ (6) CVaR loss에 weight_map(클러스터 가중치) 실제 반영
-    - shortage / inventory aggregate를 cluster weight로 가중합
-    - rate 계산 시 분모에 W_SCALE을 포함해 스케일 복원
 """
 
 from __future__ import annotations
@@ -36,8 +24,8 @@ WEIRD_SPACES = ["\ufeff", "\u200b", "\u200c", "\u200d", "\xa0"]
 PAST_MARKERS = ["작년", "전년", "지난해"]
 
 HORIZON_KIND_KEYWORDS = {
-    "planned":  ["예정"],   # 예정 수주량
-    "expected": ["예상"],   # 예상 수주량
+    "planned":  ["예정"],
+    "expected": ["예상"],
     "both":     ["예정", "예상"],
 }
 
@@ -56,11 +44,6 @@ def _is_past_ref(col: str) -> bool:
 
 
 def _extract_horizon_index(col: str) -> Optional[int]:
-    """
-    - "T일 ..." -> 0
-    - "T+3일 ..." -> 3
-    - 축약형 "T" -> 0, "T+3" -> 3
-    """
     s = _normalize_col(col)
 
     if s == "T":
@@ -80,7 +63,6 @@ def _extract_horizon_index(col: str) -> Optional[int]:
 
 
 def _within_key(h: str) -> int:
-    """같은 day 내 우선순위: 예정(0) -> 예상(1)"""
     s = _normalize_col(h)
     if "예정" in s:
         return 0
@@ -90,7 +72,6 @@ def _within_key(h: str) -> int:
 
 
 def _sort_horizons_kor(hs: List[str]) -> List[str]:
-    """day_idx 기준 + 같은 day 내 예정→예상 우선"""
     def hkey(x: str) -> int:
         hx = _extract_horizon_index(x)
         return hx if hx is not None else 10_000
@@ -100,12 +81,6 @@ def _sort_horizons_kor(hs: List[str]) -> List[str]:
 
 
 def _filter_horizons_by_kind(cols: List[str], kind: str = "planned") -> List[str]:
-    """
-    kind에 맞는 horizon만 남김.
-    - planned: "예정" 포함
-    - expected: "예상" 포함
-    - both: 둘 다 허용하되 같은 day에 둘 다 있으면 예정만 남김
-    """
     kind = str(kind).lower().strip()
     if kind not in HORIZON_KIND_KEYWORDS:
         raise ValueError(f"invalid --horizon_kind={kind}. choose from {list(HORIZON_KIND_KEYWORDS.keys())}")
@@ -147,11 +122,6 @@ def _filter_horizons_by_kind(cols: List[str], kind: str = "planned") -> List[str
 
 
 def preprocess_forecast(df: pd.DataFrame, prod_col: str = "Product_Number", dt_col: Optional[str] = "DateTime") -> pd.DataFrame:
-    """
-    - 컬럼 normalize
-    - dt_col이 실제로 존재하면 product별 최신 스냅샷으로 축약
-    - dt_col이 없으면 그대로(이미 product-level이면 OK)
-    """
     df = df.copy()
     df.columns = [_normalize_col(c) for c in df.columns]
 
@@ -312,7 +282,6 @@ def reorder_mc_scenarios_to_forecast(
 
 
 def detect_horizons(df: pd.DataFrame, horizon_kind: str = "planned") -> List[str]:
-    """자동 horizon 감지 + kind 필터 + 정렬"""
     candidates: List[str] = []
     cols = list(df.columns)
 
@@ -622,7 +591,7 @@ def optimize_plan(
                 model.AddMaxEquality(shortage_s[s][i][d], [inc, ZERO])
 
     # =====================================================
-    # ✅ NEW: Scenario aggregates (weighted by cluster weight_map)
+    # NEW: Scenario aggregates (weighted by cluster weight_map)
     # =====================================================
     W_SCALE = 100  # weight 정수화 스케일 (5.0 -> 500)
 
@@ -656,7 +625,7 @@ def optimize_plan(
     inv_rate_int   = [model.NewIntVar(0, int(loss_scale), f"inv_rate_int_s{s}")   for s in range(S)]
 
     for s in range(S):
-        # ✅ 분모에 W_SCALE 포함 (정수화한 weight 스케일 복원)
+        # 분모에 W_SCALE 포함 (정수화한 weight 스케일 복원)
         model.AddDivisionEquality(short_rate_int[s], total_short_w_s[s] * int(loss_scale), int(total_dem_i[s]) * W_SCALE)
         model.AddDivisionEquality(inv_rate_int[s],   sum_inv_w_s[s]     * int(loss_scale), int(denom_inv) * W_SCALE)
 
