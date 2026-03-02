@@ -5,21 +5,7 @@ report_llm.py (revised + fixed + executive-friendly)
 
 - production_plan.csv / forecast_by_product.csv / metrics_final.csv 기반 주간 리포트 생성
 - Facts(정량 집계)를 LLM에 제공 + Verifier Agent로 JSON 정합성 검증
-- MC 검증 결과(mc_validation.json)를 Facts에 포함해 Canonical Markdown에 항상 표시
-
-[핵심 수정/보강]
-A) total_inventory 계산 버그 수정:
-   - end_inventory는 상태값이므로 단순 sum 금지
-   - 기본: (Product_Number 기준) 마지막 day_idx 재고 합
-   - fallback: end_inventory 평균 * 제품수
-
-B) capa 없으면 0으로 두지 않고 None 처리
-C) planning_metrics.json을 선택 입력으로 받아 Canonical에 반영
-D) FailRate=0이어도 ShortageRate/BacklogRate가 크면 리스크로 표현하도록 신호등 강화
-E) markdown/ matplotlib 의존성 optional 처리 + HTML에 charts 포함
-F) ✅ (NEW) 현업 리포트 기준으로 "분포(hist)"는 기본 OFF:
-   - charts_mode: none | summary | dist
-   - MC per_scenario는 기본 trim(요약만 유지)하여 Facts 노이즈 감소
+- MC 검증 결과(mc_validation.json)를 Facts에 포함해 Markdown에 항상 표시
 """
 
 from __future__ import annotations
@@ -37,7 +23,7 @@ import numpy as np
 import re
 from pathlib import Path
 
-# ✅ optional dependency
+# optional dependency
 try:
     import markdown  # type: ignore
 except Exception:
@@ -142,7 +128,7 @@ def _load_json_if_exists(path: str) -> Optional[dict]:
 
 
 # =========================================================
-# ✅ MC dict 호환 유틸 (구버전/신버전)
+# MC dict 호환 유틸
 # =========================================================
 def _mc_stat(s: dict, metric: str) -> Optional[dict]:
     if not isinstance(s, dict):
@@ -212,8 +198,6 @@ def _trim_mc_validation(mc: Optional[dict], keep_per_scenario: bool) -> Optional
         if "per_scenario" in out:
             out.pop("per_scenario", None)
     return out
-
-
 
 def _normalize_mc_validation(mc: Optional[dict]) -> Optional[dict]:
     """Normalize MC validation JSON into a consistent shape used by the report.
@@ -519,7 +503,7 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
 
     total_prod = float(df[col_prod_qty].fillna(0.0).sum())
 
-    # ✅ inventory: 제품별 마지막 day_idx 재고 합
+    # inventory: 제품별 마지막 day_idx 재고 합
     total_inv = None
     avg_inv = None
     if col_inv and col_inv in df.columns:
@@ -533,8 +517,6 @@ def _summarize_single_plan(plan_csv: str) -> Dict:
             total_inv = float(avg_inv * df[col_prod].nunique())
 
     total_backlog = float(df[col_backlog].fillna(0.0).sum()) if (col_backlog and col_backlog in df.columns) else 0.0
-
-    # ✅ capa 없으면 None
     total_capa = None
     if col_capa and col_capa in df.columns:
         tc = float(df[col_capa].fillna(0.0).sum())
@@ -1152,7 +1134,7 @@ def verify_report(model_json: dict, facts: dict, cfg: LLMConfig) -> Dict:
 
 
 # =========================================================
-# Canonical renderer (원본 로직 유지)
+# Canonical renderer
 # =========================================================
 def _grade_traffic_light(facts: dict) -> dict:
     rep = facts.get("plan_summary_rep") or {}
@@ -1204,7 +1186,7 @@ def _grade_traffic_light(facts: dict) -> dict:
         else:
             service = "green"
 
-    # ❌ (요청 반영) 2) MC tail risk 안전장치 블록 제거
+    # 2) MC tail risk 안전장치 블록 제거
 
     ps = facts.get("product_summary") or {}
     low_cov = ps.get("top_low_coverage") or []
@@ -1212,7 +1194,7 @@ def _grade_traffic_light(facts: dict) -> dict:
     if low_cov:
         min_cov = float(low_cov[0].get("InvCoverage", 1.0))
     else:
-        # ✅ top_low_coverage가 비어도 전체 품목 기준 min coverage 사용
+        # top_low_coverage가 비어도 전체 품목 기준 min coverage 사용
         min_cov = ps.get("min_coverage", None)
         min_cov = float(min_cov) if min_cov is not None else None
     top_over = ps.get("top_overprod") or []
@@ -1262,7 +1244,7 @@ def _grade_traffic_light(facts: dict) -> dict:
     yellow_cnt = sum(1 for d in dims if d == "yellow")
     green_cnt = sum(1 for d in dims if d == "green")
 
-    # ✅ (요청 반영) 종합등급: 최악값이 아닌 "비율/분포" 기반 산정
+    # 종합등급: 비율/분포 기반 산정
     avg_score = (2.0 * red_cnt + 1.0 * yellow_cnt) / max(n, 1)
 
     if avg_score >= 1.25:
@@ -1562,8 +1544,8 @@ def build_report_with_llm(
     max_head_rows: int = 40,
     max_chars: int = 6000,
     auto_regen_on_fail: bool = True,
-    charts_mode: str = "summary",          # ✅ NEW
-    keep_mc_per_scenario: bool = False,    # ✅ NEW (default: trim)
+    charts_mode: str = "summary",          
+    keep_mc_per_scenario: bool = False,
 ) -> Dict:
     cfg = LLMConfig(model=model_name)
 
@@ -1594,7 +1576,7 @@ def build_report_with_llm(
         "product_summary": product_summary,
         "mc_validation": mc_summary,
         "planning_metrics": pm,
-        "_charts_mode": charts_mode,  # html 렌더러 전달
+        "_charts_mode": charts_mode,
     }
     facts["rule_based_actions"] = generate_rule_based_actions(facts)
 
@@ -1671,8 +1653,6 @@ def main():
     p.add_argument("--no_regen", action="store_true", help="검증 실패 시 재생성 비활성화")
     p.add_argument("--feat", default="./data/feat.csv", help="(유지) features.py가 만든 feat.csv 경로")
     p.add_argument("--mc_json", default=None, help="evaluator가 저장한 MC 요약 JSON 경로")
-
-    # ✅ NEW: charts / mc trim 옵션
     p.add_argument("--charts_mode", default="summary", choices=["none", "summary", "dist"],
                    help="HTML에 포함할 차트 수준: none(없음) | summary(Top5) | dist(분포까지)")
     p.add_argument("--keep_mc_per_scenario", action="store_true",
